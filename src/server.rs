@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::approval::{self, Approves, Decision, Subject};
 use crate::audit::{self, Scope, Status};
 use crate::config::{Mode, Settings, Transport};
-use crate::database::{Database, DbError, Outcome};
+use crate::database::{Database, DbError, Outcome, SqlError};
 use crate::query::Query;
 use crate::schema::{Catalog, ExploreSchema};
 use crate::statement::{
@@ -52,6 +52,7 @@ const CONNECTION_ACTION: &str =
 const AUTH_ACTION: &str = "use an authentication method available in this build and platform";
 const RETRY_READ_ACTION: &str =
     "check the database permissions and the requested objects, then retry";
+const CORRECT_ACTION: &str = "correct the statement and retry";
 const VERIFY_STATE_ACTION: &str = "verify the database state before retrying the operation";
 const ROLLBACK_ACTION: &str = "narrow the filters so at most 100 rows change, then retry";
 const APPROVAL_ACTION: &str =
@@ -61,6 +62,17 @@ const APPROVAL_UNAVAILABLE_ACTION: &str =
 const APPROVAL_UNAVAILABLE_MESSAGE: &str = concat!(
     "the client cannot approve mutations; use a client that supports elicitation ",
     "or start the server with --yolo"
+);
+/// Discovery text advertised in `initialize` so a client learns why a mutation
+/// needs elicitation before it tries one. It only describes the gate: it never
+/// changes which tools are listed or whether approval is required.
+const INSTRUCTIONS: &str = concat!(
+    "This server runs T-SQL against one configured SQL Server login. ",
+    "insert_row, update_rows, delete_rows and query require explicit human approval through MCP ",
+    "elicitation before any connection is opened; a client that cannot answer elicitation can only ",
+    "read and receives approval_unavailable for those tools. Start the server with --yolo (or ",
+    "MSSQL_MCP_YOLO=true) only when the operator has chosen to bypass that prompt. Read mode exposes ",
+    "only list_tables, describe_table, select_rows and explore_schema."
 );
 
 #[derive(Clone, Copy)]
@@ -184,6 +196,9 @@ struct ToolError {
     action: &'static str,
     retryable: bool,
     mutation_outcome: Option<&'static str>,
+    /// Sanitized SQL Server diagnostics; absent for every failure class whose
+    /// text could carry login or connection details.
+    sql_error: Option<SqlError>,
 }
 
 impl ToolError {
@@ -194,6 +209,7 @@ impl ToolError {
             action: MODE_ACTION,
             retryable: false,
             mutation_outcome: mutation.then_some(NOT_ATTEMPTED),
+            sql_error: None,
         }
     }
 
@@ -204,6 +220,7 @@ impl ToolError {
             action: ARGUMENTS_ACTION,
             retryable: false,
             mutation_outcome: tool.is_mutation().then_some(NOT_ATTEMPTED),
+            sql_error: None,
         }
     }
 
@@ -214,6 +231,7 @@ impl ToolError {
             action: INPUT_ACTION,
             retryable: false,
             mutation_outcome: tool.is_mutation().then_some(NOT_ATTEMPTED),
+            sql_error: None,
         }
     }
 
@@ -224,6 +242,7 @@ impl ToolError {
             action: APPROVAL_ACTION,
             retryable: false,
             mutation_outcome: Some(NOT_ATTEMPTED),
+            sql_error: None,
         }
     }
 
@@ -234,27 +253,55 @@ impl ToolError {
             action: APPROVAL_UNAVAILABLE_ACTION,
             retryable: false,
             mutation_outcome: Some(NOT_ATTEMPTED),
+            sql_error: None,
         }
     }
 
     fn from_database(error: DbError, mutation: bool) -> Self {
-        let (code, action, retryable) = match error {
+        let (code, action, retryable) = match &error {
             DbError::Busy => (DATABASE_BUSY, BUSY_ACTION, true),
             DbError::Connect => (CONNECTION_FAILED, CONNECTION_ACTION, false),
             DbError::UnsupportedAuth => (AUTH_UNAVAILABLE, AUTH_ACTION, false),
             DbError::Failed => (QUERY_FAILED, retry_action(mutation), false),
+            DbError::Server(_) => (QUERY_FAILED, retry_action(mutation), false),
+            // The server already finished the generated transaction without
+            // committing, so the operator has nothing to verify; only the
+            // statement itself needs correcting.
+            DbError::RolledBack(_) => (QUERY_FAILED, CORRECT_ACTION, false),
             DbError::Timeout => (TIMEOUT, retry_action(mutation), false),
-            DbError::UnexpectedResult => (UNRECOGNIZED_RESULT, retry_action(mutation), false),
+            DbError::UnexpectedResult => (
+                UNRECOGNIZED_RESULT,
+                "inspect the statement and returned result sets",
+                false,
+            ),
+        };
+        let mutation_outcome = if !mutation {
+            None
+        } else {
+            match &error {
+                DbError::Busy | DbError::Connect | DbError::UnsupportedAuth => Some(NOT_ATTEMPTED),
+                DbError::RolledBack(_) => Some(ROLLED_BACK),
+                // A result-shape failure only says the response was not what we
+                // can decode: it must never imply that data changed, and for an
+                // arbitrary batch it cannot tell us what earlier statements
+                // did, so no outcome is claimed.
+                DbError::UnexpectedResult | DbError::Server(_) => None,
+                DbError::Failed | DbError::Timeout => Some(UNKNOWN_OUTCOME),
+            }
+        };
+        let sql_error = match &error {
+            DbError::Server(diagnostics) | DbError::RolledBack(diagnostics) => {
+                Some(diagnostics.clone())
+            }
+            _ => None,
         };
         Self {
             code,
-            message: error.message(mutation).to_owned(),
+            message: error.message(mutation),
             action,
             retryable,
-            mutation_outcome: mutation.then_some(match error {
-                DbError::Busy | DbError::Connect | DbError::UnsupportedAuth => NOT_ATTEMPTED,
-                DbError::Failed | DbError::Timeout | DbError::UnexpectedResult => UNKNOWN_OUTCOME,
-            }),
+            mutation_outcome,
+            sql_error,
         }
     }
 
@@ -267,6 +314,13 @@ impl ToolError {
         });
         if let Some(outcome) = self.mutation_outcome {
             structured["mutation_outcome"] = Value::String(outcome.to_owned());
+        }
+        if let Some(diagnostics) = self.sql_error {
+            structured["sql_error"] = json!({
+                "number": diagnostics.number,
+                "severity": diagnostics.severity,
+                "message": diagnostics.message,
+            });
         }
         let mut result = CallToolResult::error(vec![ContentBlock::text(self.message)]);
         result.structured_content = Some(structured);
@@ -713,9 +767,12 @@ impl McpServer {
 
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
-            Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
-        )
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(INSTRUCTIONS)
     }
 
     async fn list_tools(
@@ -915,4 +972,159 @@ fn build_tools() -> Result<Vec<Tool>, &'static str> {
         )
         .with_annotations(read()),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact wire shape of a rendered tool error.
+    fn wire(error: ToolError) -> Value {
+        serde_json::to_value(error.into_result()).expect("a tool error serializes to JSON")
+    }
+
+    fn sql_error() -> SqlError {
+        SqlError {
+            number: 207,
+            severity: 16,
+            message: "Invalid column name 'missing'.".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_sql_server_rejection_reports_number_severity_and_message() {
+        let json = wire(ToolError::from_database(
+            DbError::Server(sql_error()),
+            false,
+        ));
+        assert_eq!(json["isError"], true, "{json}");
+        assert_eq!(json["structuredContent"]["code"], QUERY_FAILED, "{json}");
+        assert_eq!(json["structuredContent"]["retryable"], false, "{json}");
+        assert_eq!(
+            json["structuredContent"]["sql_error"],
+            json!({
+                "number": 207,
+                "severity": 16,
+                "message": "Invalid column name 'missing'.",
+            }),
+            "{json}"
+        );
+        assert_eq!(
+            json["content"][0]["text"],
+            json!("SQL Server error 207 (severity 16): Invalid column name 'missing'."),
+            "{json}"
+        );
+        assert_eq!(
+            json["content"][0]["text"], json["structuredContent"]["message"],
+            "the text must match the structured message: {json}"
+        );
+        assert!(
+            json["structuredContent"].get("mutation_outcome").is_none(),
+            "a read must not report an outcome: {json}"
+        );
+
+        // SQL Server directly rejected a statement. For a raw batch the
+        // caller must check preceding statements; neither outcome is claimed.
+        let json = wire(ToolError::from_database(DbError::Server(sql_error()), true));
+        assert!(
+            json["structuredContent"].get("mutation_outcome").is_none(),
+            "{json}"
+        );
+        assert_eq!(
+            json["structuredContent"]["action"], VERIFY_STATE_ACTION,
+            "{json}"
+        );
+        assert_eq!(json["structuredContent"]["code"], QUERY_FAILED, "{json}");
+        assert_eq!(
+            json["structuredContent"]["sql_error"]["number"], 207,
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn a_verified_rollback_reports_the_outcome_without_a_row_count() {
+        let json = wire(ToolError::from_database(
+            DbError::RolledBack(sql_error()),
+            true,
+        ));
+        assert_eq!(json["isError"], true, "{json}");
+        assert_eq!(json["structuredContent"]["code"], QUERY_FAILED, "{json}");
+        assert_eq!(
+            json["structuredContent"]["mutation_outcome"], ROLLED_BACK,
+            "{json}"
+        );
+        assert_eq!(json["structuredContent"]["retryable"], false, "{json}");
+        assert_eq!(
+            json["structuredContent"]["sql_error"]["severity"], 16,
+            "{json}"
+        );
+        assert!(
+            json["structuredContent"].get("affected_rows").is_none(),
+            "the server never reported a row count: {json}"
+        );
+        assert!(
+            json["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("no changes from this call were committed")),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn failures_without_server_diagnostics_stay_generic() {
+        for error in [
+            DbError::Connect,
+            DbError::Timeout,
+            DbError::Failed,
+            DbError::Busy,
+        ] {
+            let json = wire(ToolError::from_database(error, true));
+            assert!(
+                json["structuredContent"].get("sql_error").is_none(),
+                "only a server rejection carries diagnostics: {json}"
+            );
+        }
+        let json = wire(ToolError::from_database(DbError::Connect, true));
+        assert_eq!(
+            json["content"][0]["text"], "database operation failed",
+            "{json}"
+        );
+        assert_eq!(
+            json["structuredContent"]["mutation_outcome"], NOT_ATTEMPTED,
+            "{json}"
+        );
+        let json = wire(ToolError::from_database(DbError::Timeout, true));
+        assert_eq!(
+            json["structuredContent"]["mutation_outcome"], UNKNOWN_OUTCOME,
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn a_result_shape_failure_never_claims_a_mutation_outcome() {
+        for mutation in [true, false] {
+            let json = wire(ToolError::from_database(
+                DbError::UnexpectedResult,
+                mutation,
+            ));
+            assert_eq!(json["isError"], true, "{json}");
+            assert_eq!(
+                json["structuredContent"]["code"], UNRECOGNIZED_RESULT,
+                "{json}"
+            );
+            assert_eq!(json["structuredContent"]["retryable"], false, "{json}");
+            assert_eq!(
+                json["content"][0]["text"], "database returned an unexpected result",
+                "{json}"
+            );
+            assert!(
+                json["structuredContent"].get("mutation_outcome").is_none(),
+                "a result-shape failure must not imply that data may have changed: {json}"
+            );
+            assert!(
+                json["structuredContent"].get("sql_error").is_none(),
+                "a result-shape failure carries no server diagnostics: {json}"
+            );
+        }
+    }
 }

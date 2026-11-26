@@ -20,6 +20,12 @@ const MAX_ROWS: usize = 100;
 const MAX_COLUMNS: usize = 16;
 const MAX_CELL_UNITS: usize = 1024;
 const MUTATION_COLUMN: &str = "affected_rows";
+/// Shortest configured value used as a redaction needle: a single character
+/// would rewrite ordinary prose without protecting a usable credential.
+const REDACTED: &str = "[redacted]";
+/// How many transactions the session still holds open. Only ever sent after the
+/// generated mutation wrapper was rejected, on the same connection.
+const TRANSACTION_PROBE: &str = "SELECT CONVERT(nvarchar(20), @@TRANCOUNT) AS [open_transactions]";
 
 type Connection = Client<Compat<TcpStream>>;
 
@@ -36,35 +42,71 @@ pub enum Outcome {
     Executed,
 }
 
-/// Sanitized failure classes; the original driver error is never exposed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Diagnostics of one SQL Server rejection, prepared for the client boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlError {
+    /// SQL Server error number, for example 207 for an invalid column name.
+    pub number: u32,
+    /// SQL Server severity class.
+    pub severity: u8,
+    /// Sanitized server message; see [`Database::sanitize`].
+    pub message: String,
+}
+
+/// Sanitized failure classes; the original driver exception is never exposed.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DbError {
     Busy,
     /// The connection, TLS or login handshake failed before any statement ran.
     Connect,
     Timeout,
     Failed,
+    /// SQL Server returned an error but no rollback was confirmed.
+    Server(SqlError),
+    /// SQL Server rejected the statement inside the generated transaction, which
+    /// a probe on the same connection verified is no longer open: nothing from
+    /// this call was committed.
+    RolledBack(SqlError),
     UnsupportedAuth,
     UnexpectedResult,
 }
 
 impl DbError {
-    pub const fn message(self, mutation: bool) -> &'static str {
+    pub fn message(&self, mutation: bool) -> String {
         match (self, mutation) {
-            (Self::Busy, _) => "too many database operations are in progress",
+            (Self::Busy, _) => "too many database operations are in progress".to_owned(),
             (Self::Timeout, true) => {
-                "database operation timed out; the mutation outcome is unknown"
+                "database operation timed out; the mutation outcome is unknown".to_owned()
             }
-            (Self::Timeout, false) => "database operation timed out",
-            (Self::Connect, _) => "database operation failed",
-            (Self::Failed, true) => "database operation failed; the mutation outcome is unknown",
-            (Self::Failed, false) => "database operation failed",
-            (Self::UnsupportedAuth, _) => "authentication method is not available in this build",
-            (Self::UnexpectedResult, true) => {
-                "database returned an unexpected result; the mutation outcome is unknown"
+            (Self::Timeout, false) => "database operation timed out".to_owned(),
+            (Self::Connect, _) => "database operation failed".to_owned(),
+            (Self::Failed, true) => {
+                "database operation failed; the mutation outcome is unknown".to_owned()
             }
-            (Self::UnexpectedResult, false) => "database returned an unexpected result",
+            (Self::Failed, false) => "database operation failed".to_owned(),
+            (Self::Server(error), _) => error.summary(),
+            (Self::RolledBack(error), _) => {
+                format!(
+                    "{}; no changes from this call were committed",
+                    error.summary()
+                )
+            }
+            (Self::UnsupportedAuth, _) => {
+                "authentication method is not available in this build".to_owned()
+            }
+            // A shape failure says nothing about the data, so it neither claims
+            // an outcome nor talks about one.
+            (Self::UnexpectedResult, _) => "database returned an unexpected result".to_owned(),
         }
+    }
+}
+
+impl SqlError {
+    fn summary(&self) -> String {
+        format!(
+            "SQL Server error {} (severity {}): {}",
+            self.number, self.severity, self.message
+        )
     }
 }
 
@@ -98,26 +140,234 @@ impl Database {
 
     async fn run(&self, statement: Statement) -> Result<Outcome, DbError> {
         let mut client = self.connect().await?;
-        let mut stream = if statement.execution == Execution::Batch {
+        let execution = statement.execution;
+        match self.execute_on(&mut client, statement).await {
+            Ok(outcome) => Ok(outcome),
+            // Only the generated table mutation owns a server-controlled
+            // transaction that can be verified after a rejection: the wrapper
+            // runs under `XACT_ABORT ON` inside one transaction, so a rejection
+            // either rolled it back or never started it and nothing was
+            // committed. A raw batch is different: its error can arrive after
+            // earlier statements already committed, so do not claim an outcome
+            // for the batch as a whole.
+            Err(DbError::Server(error)) if execution == Execution::Status => {
+                if transaction_closed(&mut client).await {
+                    Err(DbError::RolledBack(error))
+                } else {
+                    Err(DbError::Server(error))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Send one statement on an open connection and decode its result shape.
+    async fn execute_on(
+        &self,
+        client: &mut Connection,
+        statement: Statement,
+    ) -> Result<Outcome, DbError> {
+        let execution = statement.execution;
+        let limit = statement.limit;
+        let mut stream = if execution == Execution::Batch {
             client
                 .simple_query(statement.sql)
                 .await
-                .map_err(|_| DbError::Failed)?
+                .map_err(|error| self.driver_error(error))?
         } else {
             let mut query = Query::new(statement.sql);
             for parameter in statement.parameters {
                 query.bind(json_to_sql(parameter)?);
             }
             query
-                .query(&mut client)
+                .query(&mut *client)
                 .await
-                .map_err(|_| DbError::Failed)?
+                .map_err(|error| self.driver_error(error))?
         };
-        match statement.execution {
-            Execution::Rows => read_rows(&mut stream, statement.limit).await,
-            Execution::Status => read_mutation(&mut stream).await,
-            Execution::Batch => read_batch(&mut stream, statement.limit).await,
+        match execution {
+            Execution::Rows => self.read_rows(&mut stream, limit).await,
+            Execution::Status => self.read_mutation(&mut stream).await,
+            Execution::Batch => self.read_batch(&mut stream, limit).await,
         }
+    }
+
+    /// Classify one driver failure. A SQL Server rejection keeps its identity and
+    /// sanitized diagnostics; transport, TLS, protocol and decoding failures
+    /// stay one generic class because their text can carry login or connection
+    /// details.
+    fn driver_error(&self, error: tiberius::error::Error) -> DbError {
+        match rejection(&error) {
+            Some(rejection) => DbError::Server(SqlError {
+                number: rejection.number,
+                severity: rejection.severity,
+                message: self.sanitize(rejection.number, &rejection.message, &rejection.server),
+            }),
+            None => DbError::Failed,
+        }
+    }
+
+    /// Prepare an untrusted server message for the client boundary.
+    ///
+    /// Remove configured credentials and connection details, and do not relay
+    /// custom error text or standard error details known to contain row values.
+    fn sanitize(&self, number: u32, raw: &str, server: &str) -> String {
+        let secrets = self.secret_values();
+        sanitize_message(number, raw, secrets.into_iter().chain([server]))
+    }
+
+    /// Configured values that must never reach a message or the audit trail.
+    fn secret_values(&self) -> Vec<&str> {
+        let mut values = vec![self.settings.host.as_str(), self.settings.database.as_str()];
+        match &self.settings.auth {
+            Auth::Sql { user, password } => values.extend([user.as_str(), password.as_str()]),
+            Auth::Ntlm {
+                domain,
+                user,
+                password,
+            } => values.extend([domain.as_str(), user.as_str(), password.as_str()]),
+            Auth::Windows => {}
+        }
+        if let Some(token) = self.settings.token.as_deref() {
+            values.push(token);
+        }
+        values
+    }
+
+    async fn read_rows(
+        &self,
+        stream: &mut QueryStream<'_>,
+        limit: usize,
+    ) -> Result<Outcome, DbError> {
+        let mut rows = BoundedRows::new(limit);
+
+        while let Some(item) = stream
+            .try_next()
+            .await
+            .map_err(|error| self.driver_error(error))?
+        {
+            match item {
+                QueryItem::Metadata(metadata) => {
+                    rows.metadata(column_names(metadata.columns()))?;
+                }
+                QueryItem::Row(row) => {
+                    let width = rows.width().ok_or(DbError::UnexpectedResult)?;
+                    if row.len() != width {
+                        return Err(DbError::UnexpectedResult);
+                    }
+                    if rows.push(read_cells(&row, width)?)? {
+                        break;
+                    }
+                }
+            }
+        }
+
+        rows.finish().map(Outcome::Read)
+    }
+
+    /// One arbitrary batch: no result set reports successful execution, exactly
+    /// one bounded result set returns rows, and more than one is ambiguous and
+    /// rejected.
+    async fn read_batch(
+        &self,
+        stream: &mut QueryStream<'_>,
+        limit: usize,
+    ) -> Result<Outcome, DbError> {
+        let mut rows = BoundedRows::new(limit);
+        let mut result_sets = 0usize;
+        let mut full = false;
+
+        while let Some(item) = stream
+            .try_next()
+            .await
+            .map_err(|error| self.driver_error(error))?
+        {
+            match item {
+                QueryItem::Metadata(metadata) => {
+                    result_sets += 1;
+                    rows.metadata(column_names(metadata.columns()))?;
+                }
+                QueryItem::Row(row) => {
+                    if result_sets == 0 {
+                        return Err(DbError::UnexpectedResult);
+                    }
+                    if full {
+                        continue;
+                    }
+                    let width = rows.width().ok_or(DbError::UnexpectedResult)?;
+                    if row.len() != width {
+                        return Err(DbError::UnexpectedResult);
+                    }
+                    full = rows.push(read_cells(&row, width)?)?;
+                }
+            }
+        }
+
+        if result_sets == 0 {
+            return Ok(Outcome::Executed);
+        }
+        rows.finish().map(Outcome::Read)
+    }
+
+    async fn read_mutation(&self, stream: &mut QueryStream<'_>) -> Result<Outcome, DbError> {
+        let mut current_is_status = false;
+        let mut status_rows: Option<Vec<Row>> = None;
+        let mut status_sets = 0usize;
+
+        while let Some(item) = stream
+            .try_next()
+            .await
+            .map_err(|error| self.driver_error(error))?
+        {
+            match item {
+                QueryItem::Metadata(metadata) => {
+                    current_is_status = is_status_columns(metadata.columns());
+                    if current_is_status {
+                        status_sets += 1;
+                        if status_sets > 1 {
+                            return Err(DbError::UnexpectedResult);
+                        }
+                        status_rows = Some(Vec::new());
+                    } else {
+                        status_rows = None;
+                    }
+                }
+                QueryItem::Row(row) => {
+                    if current_is_status
+                        && let Some(rows) = status_rows.as_mut()
+                        && rows.len() < 2
+                    {
+                        rows.push(row);
+                    }
+                }
+            }
+        }
+
+        if status_sets != 1 {
+            return Err(DbError::UnexpectedResult);
+        }
+        let Some(rows) = status_rows else {
+            return Err(DbError::UnexpectedResult);
+        };
+        if rows.len() != 1 {
+            return Err(DbError::UnexpectedResult);
+        }
+        let row = &rows[0];
+        if row.len() != 1 {
+            return Err(DbError::UnexpectedResult);
+        }
+        let data = row
+            .get_column_data(0)
+            .map_err(|_| DbError::UnexpectedResult)?;
+        let ColumnData::String(Some(value)) = data else {
+            return Err(DbError::UnexpectedResult);
+        };
+        let affected = value
+            .parse::<i64>()
+            .map_err(|_| DbError::UnexpectedResult)?;
+        if !(-1..=MAX_ROWS as i64).contains(&affected) {
+            return Err(DbError::UnexpectedResult);
+        }
+        Ok(Outcome::Mutation(affected))
     }
 
     async fn connect(&self) -> Result<Connection, DbError> {
@@ -173,6 +423,30 @@ fn ntlm_auth(_domain: &str, _user: &str, _password: &str) -> Result<AuthMethod, 
     Err(DbError::UnsupportedAuth)
 }
 
+/// The server-supplied parts of one SQL rejection, before they are sanitized.
+struct Rejection {
+    number: u32,
+    severity: u8,
+    message: String,
+    server: String,
+}
+
+/// Separate a real SQL Server rejection from a transport, TLS, protocol or
+/// decoding failure. Only the former carries diagnostics worth reporting; the
+/// latter are reported as one generic class because their text can name the
+/// login, host or TLS peer.
+fn rejection(error: &tiberius::error::Error) -> Option<Rejection> {
+    match error {
+        tiberius::error::Error::Server(token) => Some(Rejection {
+            number: token.code(),
+            severity: token.class(),
+            message: token.message().to_owned(),
+            server: token.server().to_owned(),
+        }),
+        _ => None,
+    }
+}
+
 fn json_to_sql(value: Value) -> Result<ColumnData<'static>, DbError> {
     match value {
         Value::Null => Ok(ColumnData::String(None)),
@@ -189,64 +463,6 @@ fn json_to_sql(value: Value) -> Result<ColumnData<'static>, DbError> {
         Value::String(value) => Ok(ColumnData::String(Some(Cow::Owned(value)))),
         Value::Array(_) | Value::Object(_) => Err(DbError::Failed),
     }
-}
-
-async fn read_rows(stream: &mut QueryStream<'_>, limit: usize) -> Result<Outcome, DbError> {
-    let mut rows = BoundedRows::new(limit);
-
-    while let Some(item) = stream.try_next().await.map_err(|_| DbError::Failed)? {
-        match item {
-            QueryItem::Metadata(metadata) => {
-                rows.metadata(column_names(metadata.columns()))?;
-            }
-            QueryItem::Row(row) => {
-                let width = rows.width().ok_or(DbError::UnexpectedResult)?;
-                if row.len() != width {
-                    return Err(DbError::UnexpectedResult);
-                }
-                if rows.push(read_cells(&row, width)?)? {
-                    break;
-                }
-            }
-        }
-    }
-
-    rows.finish().map(Outcome::Read)
-}
-
-/// One arbitrary batch: no result set reports successful execution, exactly one
-/// bounded result set returns rows, and more than one is ambiguous and rejected.
-async fn read_batch(stream: &mut QueryStream<'_>, limit: usize) -> Result<Outcome, DbError> {
-    let mut rows = BoundedRows::new(limit);
-    let mut result_sets = 0usize;
-    let mut full = false;
-
-    while let Some(item) = stream.try_next().await.map_err(|_| DbError::Failed)? {
-        match item {
-            QueryItem::Metadata(metadata) => {
-                result_sets += 1;
-                rows.metadata(column_names(metadata.columns()))?;
-            }
-            QueryItem::Row(row) => {
-                if result_sets == 0 {
-                    return Err(DbError::UnexpectedResult);
-                }
-                if full {
-                    continue;
-                }
-                let width = rows.width().ok_or(DbError::UnexpectedResult)?;
-                if row.len() != width {
-                    return Err(DbError::UnexpectedResult);
-                }
-                full = rows.push(read_cells(&row, width)?)?;
-            }
-        }
-    }
-
-    if result_sets == 0 {
-        return Ok(Outcome::Executed);
-    }
-    rows.finish().map(Outcome::Read)
 }
 
 /// Bounded result state shared by `select_rows` and the raw `query` tool.
@@ -327,64 +543,6 @@ fn read_cells(row: &Row, width: usize) -> Result<Vec<(Option<String>, bool)>, Db
         cells.push(cell_text(data));
     }
     Ok(cells)
-}
-
-async fn read_mutation(stream: &mut QueryStream<'_>) -> Result<Outcome, DbError> {
-    let mut current_is_status = false;
-    let mut status_rows: Option<Vec<Row>> = None;
-    let mut status_sets = 0usize;
-
-    while let Some(item) = stream.try_next().await.map_err(|_| DbError::Failed)? {
-        match item {
-            QueryItem::Metadata(metadata) => {
-                current_is_status = is_status_columns(metadata.columns());
-                if current_is_status {
-                    status_sets += 1;
-                    if status_sets > 1 {
-                        return Err(DbError::UnexpectedResult);
-                    }
-                    status_rows = Some(Vec::new());
-                } else {
-                    status_rows = None;
-                }
-            }
-            QueryItem::Row(row) => {
-                if current_is_status
-                    && let Some(rows) = status_rows.as_mut()
-                    && rows.len() < 2
-                {
-                    rows.push(row);
-                }
-            }
-        }
-    }
-
-    if status_sets != 1 {
-        return Err(DbError::UnexpectedResult);
-    }
-    let Some(rows) = status_rows else {
-        return Err(DbError::UnexpectedResult);
-    };
-    if rows.len() != 1 {
-        return Err(DbError::UnexpectedResult);
-    }
-    let row = &rows[0];
-    if row.len() != 1 {
-        return Err(DbError::UnexpectedResult);
-    }
-    let data = row
-        .get_column_data(0)
-        .map_err(|_| DbError::UnexpectedResult)?;
-    let ColumnData::String(Some(value)) = data else {
-        return Err(DbError::UnexpectedResult);
-    };
-    let affected = value
-        .parse::<i64>()
-        .map_err(|_| DbError::UnexpectedResult)?;
-    if !(-1..=MAX_ROWS as i64).contains(&affected) {
-        return Err(DbError::UnexpectedResult);
-    }
-    Ok(Outcome::Mutation(affected))
 }
 
 fn is_status_columns(columns: &[Column]) -> bool {
@@ -561,6 +719,150 @@ fn truncate_cell(text: &str) -> String {
     String::from_utf16_lossy(&units)
 }
 
+fn sanitize_message<S: AsRef<str>>(
+    number: u32,
+    raw: &str,
+    secrets: impl IntoIterator<Item = S>,
+) -> String {
+    match number {
+        50000.. => return "SQL Server reported a user-defined error; details omitted".to_owned(),
+        2601 | 2627 => return "A duplicate key violates a uniqueness constraint".to_owned(),
+        2628 => return "String or binary data would be truncated".to_owned(),
+        245 | 8114 => {
+            return "SQL Server could not convert a value to the requested type".to_owned();
+        }
+        _ => {}
+    }
+    let text = normalize_message(raw);
+    if contains_connection_details(&text) {
+        return "SQL Server diagnostic text omitted because it contains connection details"
+            .to_owned();
+    }
+    let text = redact_secrets(text, secrets);
+    if text.encode_utf16().count() > MAX_CELL_UNITS {
+        format!("{}…", truncate_cell(&text))
+    } else {
+        text
+    }
+}
+
+fn contains_connection_details(text: &str) -> bool {
+    const FIELDS: &[&str] = &[
+        "password",
+        "pwd",
+        "user id",
+        "uid",
+        "username",
+        "server",
+        "data source",
+        "initial catalog",
+        "access token",
+        "dsn",
+        "connection string",
+    ];
+    let folded = text.to_ascii_lowercase();
+    folded.contains("://")
+        || folded.match_indices('=').any(|(index, _)| {
+            let key = folded[..index].trim_end();
+            FIELDS.iter().any(|field| key.ends_with(field))
+        })
+}
+
+fn normalize_message(raw: &str) -> String {
+    let mut text = String::with_capacity(raw.len().min(MAX_CELL_UNITS));
+    let mut separation = false;
+    for character in raw.chars() {
+        if character.is_control() || character.is_whitespace() {
+            separation = !text.is_empty();
+            continue;
+        }
+        if separation {
+            text.push(' ');
+            separation = false;
+        }
+        text.push(character);
+    }
+    text
+}
+
+fn redact_secrets<S: AsRef<str>>(text: String, secrets: impl IntoIterator<Item = S>) -> String {
+    let mut text = text;
+    for secret in secrets {
+        let secret = normalize_message(secret.as_ref());
+        if !secret.is_empty() {
+            text = replace_ignore_ascii_case(&text, &secret, REDACTED);
+        }
+    }
+    text
+}
+
+/// Replace every ASCII-case-insensitive occurrence of `needle`. ASCII folding
+/// keeps byte lengths, so byte offsets found in the folded copy are valid
+/// boundaries in the original text.
+fn replace_ignore_ascii_case(text: &str, needle: &str, replacement: &str) -> String {
+    let folded = text.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = 0;
+    let single_character = needle.chars().count() == 1;
+    for (start, matched) in folded.match_indices(&needle) {
+        let end = start + matched.len();
+        if single_character
+            && (text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+                || text[end..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric))
+        {
+            continue;
+        }
+        redacted.push_str(&text[rest..start]);
+        redacted.push_str(replacement);
+        rest = end;
+    }
+    redacted.push_str(&text[rest..]);
+    redacted
+}
+
+/// Verify that the session has no transaction left open.
+///
+/// The rejected statement ran in the generated wrapper, which owns exactly one
+/// transaction under `XACT_ABORT ON`, so the server can only have rolled that
+/// transaction back or never started it; both leave nothing committed. This
+/// probe confirms the part we can observe from the client: the connection is
+/// still usable and holds no open transaction. A dropped connection or any
+/// unexpected answer is not evidence, so it reports `false` and the caller
+/// makes no rollback claim.
+async fn transaction_closed(client: &mut Connection) -> bool {
+    let Ok(mut stream) = client.simple_query(TRANSACTION_PROBE).await else {
+        return false;
+    };
+    let mut open: Option<String> = None;
+    loop {
+        match stream.try_next().await {
+            Ok(Some(QueryItem::Row(row))) => {
+                if open.is_some() {
+                    return false;
+                }
+                let Ok(data) = row.get_column_data(0) else {
+                    return false;
+                };
+                let (Some(text), false) = cell_text(data) else {
+                    return false;
+                };
+                open = Some(text);
+            }
+            Ok(Some(QueryItem::Metadata(_))) => {}
+            Ok(None) => break,
+            Err(_) => return false,
+        }
+    }
+    open.as_deref() == Some("0")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,5 +973,143 @@ mod tests {
         assert_eq!(date_text(639_905), "1753-01-01");
         assert_eq!(datetime_text(0, 0), "1900-01-01 00:00:00.000");
         assert_eq!(datetime_text(0, 12_960_000), "1900-01-01 12:00:00.000");
+    }
+
+    #[test]
+    fn server_messages_are_normalized_and_bounded() {
+        let raw =
+            "\r\nInvalid\tcolumn name 'missing'.\u{7}\nThe statement has been \r\nterminated.  ";
+        assert_eq!(
+            normalize_message(raw),
+            "Invalid column name 'missing'. The statement has been terminated."
+        );
+        assert_eq!(normalize_message(""), "");
+        assert_eq!(normalize_message("\u{0}\u{1} \t"), "");
+
+        let long = "x".repeat(MAX_CELL_UNITS + 100);
+        let bounded = sanitize_message(207, &long, std::iter::empty::<&str>());
+        assert!(bounded.ends_with('…'), "a cut must be marked");
+        assert!(
+            bounded.encode_utf16().count() <= MAX_CELL_UNITS + 1,
+            "the message must stay bounded: {}",
+            bounded.encode_utf16().count()
+        );
+    }
+
+    #[test]
+    fn configured_secrets_are_redacted_from_server_messages() {
+        let raw = concat!(
+            "Login APPUSER failed on 127.0.0.1 for database 'Sales' with password 'hunter2' ",
+            "near 'secret-value'."
+        );
+        let text = redact_secrets(
+            normalize_message(raw),
+            ["appuser", "127.0.0.1", "sales", "hunter2", "SQLPROD"],
+        );
+        for secret in ["APPUSER", "127.0.0.1", "Sales", "hunter2"] {
+            assert!(
+                !text.contains(secret),
+                "the sanitized message leaked {secret:?}: {text}"
+            );
+        }
+        assert!(
+            text.contains("[redacted]"),
+            "redaction must be visible: {text}"
+        );
+        assert!(
+            text.contains("Login") && text.contains("failed") && text.contains("near"),
+            "the diagnostics must survive redaction: {text}"
+        );
+    }
+
+    #[test]
+    fn short_secrets_are_not_redacted_into_every_word() {
+        let text = redact_secrets("database 'a' failed".to_owned(), ["a"]);
+        assert_eq!(text, "database '[redacted]' failed");
+    }
+
+    #[test]
+    fn diagnostics_redact_before_truncating_and_drop_untrusted_details() {
+        let secret = "TEST_SECRET_MARKER";
+        let raw = format!("{} {secret}", "x".repeat(MAX_CELL_UNITS - 6));
+        assert!(!sanitize_message(207, &raw, [secret]).contains("TEST_"));
+        assert_eq!(
+            sanitize_message(50000, "arbitrary user-defined details", [secret]),
+            "SQL Server reported a user-defined error; details omitted"
+        );
+        assert_eq!(
+            sanitize_message(
+                207,
+                "Invalid column 'Server=placeholder; Password=placeholder'.",
+                [secret]
+            ),
+            "SQL Server diagnostic text omitted because it contains connection details"
+        );
+    }
+
+    fn rejection_message() -> SqlError {
+        SqlError {
+            number: 515,
+            severity: 16,
+            message: "Cannot insert the value NULL into column 'group_id'.".to_owned(),
+        }
+    }
+
+    #[test]
+    fn failure_messages_describe_the_outcome_they_report() {
+        let rejection = rejection_message();
+        assert_eq!(
+            DbError::Server(rejection.clone()).message(true),
+            concat!(
+                "SQL Server error 515 (severity 16): Cannot insert the value NULL into column ",
+                "'group_id'."
+            )
+        );
+        assert_eq!(
+            DbError::Server(rejection.clone()).message(false),
+            "SQL Server error 515 (severity 16): Cannot insert the value NULL into column \
+             'group_id'."
+        );
+        assert_eq!(
+            DbError::RolledBack(rejection).message(true),
+            concat!(
+                "SQL Server error 515 (severity 16): Cannot insert the value NULL into column ",
+                "'group_id'.; no changes from this call were committed"
+            )
+        );
+        // A result-shape failure says nothing about the data in either mode.
+        for mutation in [true, false] {
+            assert_eq!(
+                DbError::UnexpectedResult.message(mutation),
+                "database returned an unexpected result"
+            );
+        }
+        assert_eq!(
+            DbError::Timeout.message(true),
+            "database operation timed out; the mutation outcome is unknown"
+        );
+        assert_eq!(
+            DbError::Timeout.message(false),
+            "database operation timed out"
+        );
+        assert_eq!(DbError::Connect.message(true), "database operation failed");
+    }
+
+    #[test]
+    fn transport_failures_are_not_sql_rejections() {
+        for error in [
+            tiberius::error::Error::Io {
+                kind: std::io::ErrorKind::UnexpectedEof,
+                message: "connection reset by peer at db.internal".to_owned(),
+            },
+            tiberius::error::Error::Protocol("unexpected token".into()),
+            tiberius::error::Error::Tls("handshake failed for db.internal".into()),
+            tiberius::error::Error::Conversion("bad value".into()),
+        ] {
+            assert!(
+                rejection(&error).is_none(),
+                "a transport failure must not be reported as a SQL rejection: {error}"
+            );
+        }
     }
 }

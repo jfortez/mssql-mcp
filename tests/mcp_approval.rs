@@ -78,6 +78,8 @@ struct Server {
     stdin: Option<ChildStdin>,
     messages: Receiver<Result<Value, String>>,
     audit: Arc<Mutex<Vec<String>>>,
+    /// The full `initialize` response, which carries the discovery instructions.
+    initialize: Value,
     next_id: u64,
 }
 
@@ -168,13 +170,15 @@ impl Server {
             stdin: Some(stdin),
             messages,
             audit,
+            initialize: Value::Null,
             next_id: 1,
         };
-        server.initialize(elicitation);
+        let initialize = server.request_initialize(elicitation);
+        server.initialize = initialize;
         server
     }
 
-    fn initialize(&mut self, elicitation: bool) {
+    fn request_initialize(&mut self, elicitation: bool) -> Value {
         let capabilities = if elicitation {
             json!({"elicitation": {}})
         } else {
@@ -193,6 +197,7 @@ impl Server {
             "initialize failed: {response}"
         );
         self.notify("notifications/initialized", json!({}));
+        response
     }
 
     fn notify(&mut self, method: &str, params: Value) {
@@ -338,6 +343,54 @@ fn error_text(result: &Value) -> &str {
     result["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("tool error without text: {result}"))
+}
+
+#[test]
+fn initialize_instructions_explain_the_gate_without_changing_it() {
+    for mode in ["write", "both"] {
+        let peer = CountingPeer::start();
+        let mut server = Server::start(mode, peer.port, Yolo::Off, false);
+        let instructions = server.initialize["result"]["instructions"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{mode}: initialize carries no instructions: {}",
+                    server.initialize
+                )
+            });
+        for expected in ["approval", "elicitation", "--yolo"] {
+            assert!(
+                instructions.contains(expected),
+                "{mode}: the instructions must name {expected:?}: {instructions}"
+            );
+        }
+        // Discovery is not a bypass: the same client still cannot mutate.
+        let result = server.call_tool(
+            "insert_row",
+            json!({"table": {"name": "Items"}, "values": {"id": 1}}),
+        );
+        assert_eq!(
+            approval_error(&result)["code"],
+            "approval_unavailable",
+            "{mode}: instructions must not change the gate: {result}"
+        );
+        thread::sleep(CONNECTION_GRACE);
+        assert_eq!(
+            peer.attempts(),
+            0,
+            "{mode}: an unapproved mutation must not connect"
+        );
+    }
+
+    // Read mode advertises the same discovery text it can actually honour.
+    let server = Server::start("read", closed_port(), Yolo::Off, false);
+    let instructions = server.initialize["result"]["instructions"]
+        .as_str()
+        .unwrap_or_else(|| panic!("read: no instructions: {}", server.initialize));
+    assert!(
+        instructions.contains("--yolo") && instructions.contains("read"),
+        "read: the instructions must describe the read-only contract: {instructions}"
+    );
 }
 
 #[test]

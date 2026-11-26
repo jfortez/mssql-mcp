@@ -176,7 +176,7 @@ The Agent Client Protocol does not carry an MCP transport by itself. An ACP host
 
 `table` is `{"schema": "dbo", "name": "Products"}`; functions such as `schema` default to `dbo`. Filters are equality checks combined with `AND`, `null` matching `NULL`. Selects return 25 rows by default (maximum 100) and projects every column as text, capped at 1,024 UTF-16 units; a `truncated` flag reports a cut cell or page. Use a unique `order_by` for stable pagination. Mutations return `affected_rows: -1` with `mutation_outcome: rolled_back` when the 100-row limit rolled back.
 
-`query` runs one arbitrary T-SQL batch under the configured principal, exactly as sent. It can read or change any data or server state that principal can reach, including other databases, and it has no affected-row cap. Every batch requires approval unless `--yolo`, and the prompt carries the exact SQL so the human consents to the real bytes. At most one result set is returned, bounded to 100 rows by default (`limit` can lower it), 16 columns and 1,024 UTF-16 units per cell; a `truncated` flag reports a cut. A batch with no result set returns `executed: true`; more than one result set is rejected as `unrecognized_result`. A failure or timeout after the batch starts leaves the outcome unknown, and SQL Server permissions remain the real boundary: the approval prompt is a guardrail, not a sandbox.
+`query` runs one arbitrary T-SQL batch under the configured principal, exactly as sent. It can read or change any data or server state that principal can reach, including other databases, and it has no affected-row cap. Every batch requires approval unless `--yolo`, and the prompt carries the exact SQL so the human consents to the real bytes. At most one result set is returned, bounded to 100 rows by default (`limit` can lower it), 16 columns and 1,024 UTF-16 units per cell; a `truncated` flag reports a cut. A batch with no result set returns `executed: true`; more than one result set returns `unrecognized_result` without a mutation outcome. If SQL Server rejects a statement in a raw batch, check the database before retrying: earlier statements may have committed. SQL Server permissions remain the real boundary: the approval prompt is a guardrail, not a sandbox.
 
 `explore_schema` is read-only and available in every mode. It returns one indented `tree` string: schemas; under each, tables with column count and primary key, columns with type and nullability, outgoing and incoming foreign-key relations, views, procedures with parameter signatures and definition size, and functions with return type and parameter signatures. `schema` narrows the tree, `include` selects `tables`, `views`, `procedures` and `functions` (all four by default), and `definition: true` inlines procedure and function bodies from `sys.sql_modules`. Foreign-key edges identify the constraint and pair the child and referenced columns in constraint order. Catalog queries and the tree itself are bounded: per-table column cuts and per-routine definition cuts say how much was omitted. Any cut sets `truncated` and ends the tree with a visible `… truncated` line.
 
@@ -192,7 +192,7 @@ JSON Lines on stderr, stdout reserved for MCP. One `tool_call` record per handle
 
 Records carry the known tool name, effective mode, status, error code, duration, the validated `scope` and bounded counters (`rows`, `affected_rows`, `truncated`). Mutation records and every `query` batch that reaches the approval gate add `approval` as `yolo`, `granted`, `denied` or `unavailable`; `explore_schema` and the other read tools never carry it. A `query` record has no `scope`, because arbitrary SQL has no validated target, and it never contains the batch text. Records never contain SQL text, values, credentials, host names, result rows or raw driver messages; validated schema and table names do appear. The trail is operational evidence, not a signed or tamper-proof audit log: capture it with your client or supervisor.
 
-Tool errors keep `isError`, a human-readable `content[0].text` and a `structuredContent` object with `code`, `message`, `action`, `retryable`, and for writes `mutation_outcome`:
+Tool errors keep `isError`, a human-readable `content[0].text` and a `structuredContent` object with `code`, `message`, `action`, `retryable`, and a `mutation_outcome` for writes when the server can describe it. A SQL Server rejection also includes `sql_error: {number, severity, message}`. Login and transport diagnostics, custom error text, connection details, and known value-bearing error details are not relayed.
 
 | `code` | Cause | `mutation_outcome` |
 | --- | --- | --- |
@@ -204,9 +204,10 @@ Tool errors keep `isError`, a human-readable `content[0].text` and a `structured
 | `database_busy` | four operations already active | `not_attempted` |
 | `connection_failed` | TCP, TLS or login failed before any statement | `not_attempted` |
 | `authentication_unavailable` | mode missing from this build or platform | `not_attempted` |
-| `query_failed` | SQL Server failed the statement | `unknown` |
+| `query_failed` | SQL Server rejected the statement | `rolled_back` after confirming a generated mutation did not commit; otherwise omitted |
+| `query_failed` | connection or driver failed during execution | `unknown` |
 | `timeout` | the operation deadline elapsed | `unknown` |
-| `unrecognized_result` | unexpected result shape from the driver | `unknown` |
+| `unrecognized_result` | unexpected result shape from the driver | omitted |
 | `mutation_rolled_back` | more than 100 rows would change | `rolled_back` |
 
 `retryable` is `true` only for a busy server that ran nothing. `mutation_outcome: unknown` means the statement may have reached SQL Server: read the database state before retrying. An unknown tool name stays a JSON-RPC `-32601` error with `data.code: "unknown_tool"`.
