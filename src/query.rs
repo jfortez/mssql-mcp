@@ -22,6 +22,7 @@ pub struct Query {
     /// One T-SQL batch; every statement in it runs exactly as written.
     pub sql: String,
     /// Maximum rows to return from the result set, 1–100; defaults to 100.
+    #[schemars(range(min = 1, max = 100))]
     pub limit: Option<u32>,
 }
 

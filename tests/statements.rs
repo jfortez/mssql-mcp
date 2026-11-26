@@ -24,7 +24,7 @@ fn selects_quoted_identifiers_and_keeps_data_in_bindings() {
     );
     assert_eq!(
         statement.parameters,
-        vec![json!("O'Brien"), json!(10), json!(5)]
+        vec![json!("O'Brien"), json!(10), json!(6)]
     );
     assert!(!statement.mutation);
 }
@@ -38,13 +38,13 @@ fn unsorted_selects_bound_the_row_limit_with_top() {
         statement.sql,
         "SELECT TOP (@P1) LEFT(CONVERT(nvarchar(max), [id], 126), 1025) AS [id] FROM [dbo].[Items] AS [t]"
     );
-    assert_eq!(statement.parameters, vec![json!(25)]);
+    assert_eq!(statement.parameters, vec![json!(26)]);
     let statement = select(
         json!({"table": {"name": "Items", "schema": "dbo"}, "columns": ["id"], "limit": 100}),
     )
     .prepare()
     .unwrap();
-    assert_eq!(statement.parameters, vec![json!(100)]);
+    assert_eq!(statement.parameters, vec![json!(101)]);
 }
 
 #[test]
@@ -53,7 +53,7 @@ fn select_rejects_invalid_identifiers_limits_and_unordered_offsets() {
         (
             "columns",
             json!([""]),
-            "identifier must contain 1–128 UTF-16 units and no control characters",
+            "columns must contain valid identifiers (1–128 UTF-16 units, no control characters)",
         ),
         (
             "columns",
@@ -65,7 +65,7 @@ fn select_rejects_invalid_identifiers_limits_and_unordered_offsets() {
         (
             "filters",
             json!({"id": 18446744073709551615u64}),
-            "integer exceeds signed 64-bit range; pass it as a string",
+            "filters: integer exceeds signed 64-bit range; pass it as a string",
         ),
     ] {
         let mut input = json!({"table": {"name": "Items"}, "columns": ["id"]});
@@ -162,17 +162,19 @@ fn update_and_delete_reject_empty_filters() {
 
 #[test]
 fn values_and_filters_stay_within_bounds() {
-    let columns = (0..17).map(|index| format!("c{index}")).collect::<Vec<_>>();
+    let columns = (0..22).map(|index| format!("c{index}")).collect::<Vec<_>>();
     let input = json!({"table": {"name": "Items"}, "columns": columns});
-    assert_eq!(
-        select(input).prepare().unwrap_err(),
-        "columns must contain between 1 and 16 names"
-    );
-    let input = json!({"table": {"name": "Items"}, "columns": []});
-    assert_eq!(
-        select(input).prepare().unwrap_err(),
-        "columns must contain between 1 and 16 names"
-    );
+    assert!(select(input).prepare().is_ok());
+    for count in [0, 65] {
+        let columns = (0..count)
+            .map(|index| format!("c{index}"))
+            .collect::<Vec<_>>();
+        let input = json!({"table": {"name": "Items"}, "columns": columns});
+        assert_eq!(
+            select(input).prepare().unwrap_err(),
+            "columns must contain between 1 and 64 names"
+        );
+    }
     let order_by = (0..17).map(|index| format!("c{index}")).collect::<Vec<_>>();
     let input = json!({"table": {"name": "Items"}, "columns": ["id"], "order_by": order_by});
     assert_eq!(

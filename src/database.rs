@@ -13,11 +13,10 @@ use tokio::sync::Semaphore;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::config::{Auth, Settings};
-use crate::statement::{Execution, Statement};
+use crate::statement::{DEFAULT_RESULT_COLUMNS, Execution, Statement};
 
 const MAX_IN_FLIGHT: usize = 4;
 const MAX_ROWS: usize = 100;
-const MAX_COLUMNS: usize = 16;
 const MAX_CELL_UNITS: usize = 1024;
 const MUTATION_COLUMN: &str = "affected_rows";
 /// Shortest configured value used as a redaction needle: a single character
@@ -169,6 +168,7 @@ impl Database {
     ) -> Result<Outcome, DbError> {
         let execution = statement.execution;
         let limit = statement.limit;
+        let max_columns = statement.max_columns;
         let mut stream = if execution == Execution::Batch {
             client
                 .simple_query(statement.sql)
@@ -185,7 +185,7 @@ impl Database {
                 .map_err(|error| self.driver_error(error))?
         };
         match execution {
-            Execution::Rows => self.read_rows(&mut stream, limit).await,
+            Execution::Rows => self.read_rows(&mut stream, limit, max_columns).await,
             Execution::Status => self.read_mutation(&mut stream).await,
             Execution::Batch => self.read_batch(&mut stream, limit).await,
         }
@@ -237,8 +237,9 @@ impl Database {
         &self,
         stream: &mut QueryStream<'_>,
         limit: usize,
+        max_columns: usize,
     ) -> Result<Outcome, DbError> {
-        let mut rows = BoundedRows::new(limit);
+        let mut rows = BoundedRows::new(limit, max_columns);
 
         while let Some(item) = stream
             .try_next()
@@ -272,7 +273,7 @@ impl Database {
         stream: &mut QueryStream<'_>,
         limit: usize,
     ) -> Result<Outcome, DbError> {
-        let mut rows = BoundedRows::new(limit);
+        let mut rows = BoundedRows::new(limit, DEFAULT_RESULT_COLUMNS);
         let mut result_sets = 0usize;
         let mut full = false;
 
@@ -471,20 +472,22 @@ struct BoundedRows {
     rows: Vec<Vec<Option<String>>>,
     truncated: bool,
     limit: usize,
+    max_columns: usize,
 }
 
 impl BoundedRows {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, max_columns: usize) -> Self {
         Self {
             columns: None,
             rows: Vec::new(),
             truncated: false,
             limit: limit.clamp(1, MAX_ROWS),
+            max_columns,
         }
     }
 
     fn metadata(&mut self, names: Vec<String>) -> Result<(), DbError> {
-        if self.columns.is_some() || names.is_empty() || names.len() > MAX_COLUMNS {
+        if self.columns.is_some() || names.is_empty() || names.len() > self.max_columns {
             return Err(DbError::UnexpectedResult);
         }
         self.columns = Some(names);
@@ -872,24 +875,28 @@ mod tests {
     }
 
     fn one_column() -> BoundedRows {
-        let mut rows = BoundedRows::new(MAX_ROWS);
+        let mut rows = BoundedRows::new(MAX_ROWS, DEFAULT_RESULT_COLUMNS);
         rows.metadata(vec!["id".to_owned()]).expect("one column");
         rows
     }
 
     #[test]
     fn seventeen_columns_are_rejected() {
-        let mut rows = BoundedRows::new(MAX_ROWS);
-        let names = (0..=MAX_COLUMNS).map(|index| format!("c{index}")).collect();
+        let mut rows = BoundedRows::new(MAX_ROWS, DEFAULT_RESULT_COLUMNS);
+        let names = (0..=DEFAULT_RESULT_COLUMNS)
+            .map(|index| format!("c{index}"))
+            .collect();
         assert_eq!(rows.metadata(names), Err(DbError::UnexpectedResult));
     }
 
     #[test]
     fn sixteen_columns_are_accepted() {
-        let mut rows = BoundedRows::new(MAX_ROWS);
-        let names = (0..MAX_COLUMNS).map(|index| format!("c{index}")).collect();
+        let mut rows = BoundedRows::new(MAX_ROWS, DEFAULT_RESULT_COLUMNS);
+        let names = (0..DEFAULT_RESULT_COLUMNS)
+            .map(|index| format!("c{index}"))
+            .collect();
         rows.metadata(names).expect("sixteen columns");
-        assert_eq!(rows.width(), Some(MAX_COLUMNS));
+        assert_eq!(rows.width(), Some(DEFAULT_RESULT_COLUMNS));
     }
 
     #[test]
@@ -915,7 +922,7 @@ mod tests {
 
     #[test]
     fn a_requested_limit_lowers_the_row_cap() {
-        let mut rows = BoundedRows::new(2);
+        let mut rows = BoundedRows::new(2, DEFAULT_RESULT_COLUMNS);
         rows.metadata(vec!["id".to_owned()]).expect("one column");
         assert_eq!(rows.push(vec![cell("1")]), Ok(false));
         assert_eq!(rows.push(vec![cell("2")]), Ok(false));
@@ -939,7 +946,7 @@ mod tests {
 
     #[test]
     fn rows_before_metadata_are_rejected() {
-        let mut rows = BoundedRows::new(MAX_ROWS);
+        let mut rows = BoundedRows::new(MAX_ROWS, DEFAULT_RESULT_COLUMNS);
         assert_eq!(rows.push(vec![cell("1")]), Err(DbError::UnexpectedResult));
     }
 

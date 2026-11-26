@@ -7,6 +7,8 @@ use serde_json::Value;
 const DEFAULT_LIMIT: u16 = 25;
 pub(crate) const MAX_ROWS: u16 = 100;
 const MAX_ENTRIES: usize = 16;
+pub(crate) const MAX_SELECT_COLUMNS: usize = 64;
+pub(crate) const DEFAULT_RESULT_COLUMNS: usize = 16;
 const PAGE_SIZE: u16 = 100;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 const MAX_TEXT_UNITS: usize = 1025;
@@ -31,6 +33,7 @@ pub struct Statement {
     pub mutation: bool,
     pub(crate) execution: Execution,
     pub(crate) limit: usize,
+    pub(crate) max_columns: usize,
 }
 
 impl Statement {
@@ -41,6 +44,7 @@ impl Statement {
             mutation: false,
             execution: Execution::Rows,
             limit: limit.clamp(1, usize::from(MAX_ROWS)),
+            max_columns: DEFAULT_RESULT_COLUMNS,
         }
     }
 
@@ -51,6 +55,7 @@ impl Statement {
             mutation: true,
             execution: Execution::Status,
             limit: usize::from(MAX_ROWS),
+            max_columns: DEFAULT_RESULT_COLUMNS,
         }
     }
 
@@ -62,12 +67,13 @@ impl Statement {
             mutation: true,
             execution: Execution::Batch,
             limit: limit.clamp(1, usize::from(MAX_ROWS)),
+            max_columns: DEFAULT_RESULT_COLUMNS,
         }
     }
 }
 
 /// Table or view addressed by schema-qualified name.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Table {
     /// Object name without a schema prefix.
@@ -91,6 +97,40 @@ impl Table {
             name: self.name.clone(),
         })
     }
+
+    /// Resolve base types using the database's identifier collation. An empty
+    /// list selects the first columns in catalog order for a bounded sample.
+    pub(crate) fn column_types(&self, columns: &[String]) -> Result<Statement, &'static str> {
+        let target = self.resolve()?;
+        let mut binder = Binder::default();
+        let schema = binder.bind(Value::String(target.schema))?;
+        let name = binder.bind(Value::String(target.name))?;
+        let (selected, join, order) = if columns.is_empty() {
+            ("c.name", String::new(), "c.column_id")
+        } else {
+            let mut values = Vec::with_capacity(columns.len());
+            for (index, column) in columns.iter().enumerate() {
+                let parameter = binder.bind(Value::String(column.clone()))?;
+                values.push(format!("({parameter}, {index})"));
+            }
+            (
+                "requested.name",
+                format!(
+                    " JOIN (VALUES {}) AS requested(name, ordinal) ON requested.name = c.name",
+                    values.join(", ")
+                ),
+                "requested.ordinal",
+            )
+        };
+        let sql = format!(
+            "SELECT TOP ({}) CONVERT(nvarchar(128), {selected}) AS [name], CONVERT(nvarchar(128), COALESCE(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id))) AS [base_type] \
+             FROM sys.columns AS c JOIN sys.objects AS o ON o.object_id = c.object_id \
+             JOIN sys.schemas AS s ON s.schema_id = o.schema_id{join} \
+             WHERE o.type IN (N'U', N'V') AND s.name = {schema} AND o.name = {name} ORDER BY {order}",
+            MAX_SELECT_COLUMNS + 1,
+        );
+        Ok(Statement::read(sql, binder.parameters, MAX_SELECT_COLUMNS))
+    }
 }
 
 impl Target {
@@ -104,29 +144,41 @@ impl Target {
 pub struct SelectRows {
     /// Table or view to read.
     pub table: Table,
-    /// Columns to project, 1–16 unique names; every value returns as bounded text.
+    /// Columns to project, 1–64 unique names; every value returns as bounded text.
+    #[schemars(length(min = 1, max = 64))]
     pub columns: Vec<String>,
     /// Equality filters combined with AND; null matches SQL NULL.
     #[serde(default)]
     pub filters: BTreeMap<String, Value>,
     /// Ascending sort columns, at most 16; required when offset is set.
     #[serde(default)]
+    #[schemars(length(max = 16))]
     pub order_by: Vec<String>,
     /// Rows to skip; requires order_by.
     #[serde(default)]
     pub offset: u32,
     /// Maximum rows to return, 1–100; defaults to 25.
+    #[schemars(range(min = 1, max = 100))]
     pub limit: Option<u16>,
 }
 
 impl SelectRows {
     pub fn prepare(&self) -> Result<Statement, &'static str> {
-        if self.columns.is_empty() || self.columns.len() > MAX_ENTRIES {
-            return Err("columns must contain between 1 and 16 names");
+        self.prepare_with_types(&BTreeMap::new())
+    }
+
+    pub(crate) fn prepare_with_types(
+        &self,
+        types: &BTreeMap<String, String>,
+    ) -> Result<Statement, &'static str> {
+        if self.columns.is_empty() || self.columns.len() > MAX_SELECT_COLUMNS {
+            return Err("columns must contain between 1 and 64 names");
         }
         let mut seen = BTreeSet::new();
         for column in &self.columns {
-            validate_identifier(column)?;
+            validate_identifier(column).map_err(|_| {
+                "columns must contain valid identifiers (1–128 UTF-16 units, no control characters)"
+            })?;
             if !seen.insert(column.as_str()) {
                 return Err("columns must not repeat a name");
             }
@@ -142,26 +194,40 @@ impl SelectRows {
             return Err("order_by must contain at most 16 names");
         }
         for column in &self.order_by {
-            validate_identifier(column)?;
+            validate_identifier(column).map_err(|_| "order_by must contain valid identifiers")?;
         }
         if self.filters.len() > MAX_ENTRIES {
             return Err("filters must contain at most 16 entries");
         }
+        validate_identifier(self.table.schema.as_deref().unwrap_or("dbo"))
+            .map_err(|_| "table.schema must be a valid identifier")?;
+        validate_identifier(&self.table.name)
+            .map_err(|_| "table.name must be a valid identifier")?;
         let target = self.table.resolve()?;
         let projection = self
             .columns
             .iter()
-            .map(|column| projected(column))
+            .map(|column| projected(column, types.get(column).map(String::as_str)))
             .collect::<Vec<_>>()
             .join(", ");
         let mut binder = Binder::default();
+        // One lookahead row tells the decoder that another page exists.
+        let fetch = Value::from(limit + 1);
         let top = if self.order_by.is_empty() {
-            format!("TOP ({}) ", binder.bind(Value::from(limit))?)
+            format!("TOP ({}) ", binder.bind(fetch.clone())?)
         } else {
             String::new()
         };
         let mut sql = format!("SELECT {top}{projection} FROM {} AS [t]", target.sql());
-        sql.push_str(&where_clause(&self.filters, &mut binder)?);
+        sql.push_str(
+            &where_clause(&self.filters, &mut binder).map_err(|error| match error {
+                INTEGER_RANGE_ERROR => {
+                    "filters: integer exceeds signed 64-bit range; pass it as a string"
+                }
+                IDENTIFIER_ERROR => "filters must use valid column identifiers",
+                _ => "filters must use scalar values (text up to 16384 bytes)",
+            })?,
+        );
         if !self.order_by.is_empty() {
             let order = self
                 .order_by
@@ -170,12 +236,38 @@ impl SelectRows {
                 .collect::<Vec<_>>()
                 .join(", ");
             let offset = binder.bind(Value::from(self.offset))?;
-            let limit = binder.bind(Value::from(limit))?;
+            let fetch = binder.bind(fetch)?;
             sql.push_str(&format!(
-                " ORDER BY {order} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
+                " ORDER BY {order} OFFSET {offset} ROWS FETCH NEXT {fetch} ROWS ONLY"
             ));
         }
-        Ok(Statement::read(sql, binder.parameters, usize::from(limit)))
+        let mut statement = Statement::read(sql, binder.parameters, usize::from(limit));
+        statement.max_columns = MAX_SELECT_COLUMNS;
+        Ok(statement)
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SampleRows {
+    /// Table or view to sample.
+    pub table: Table,
+    /// Maximum rows to sample, 1–25; defaults to 5.
+    #[schemars(range(min = 1, max = 25))]
+    pub limit: Option<u16>,
+}
+
+impl SampleRows {
+    pub(crate) fn validate(&self) -> Result<u16, &'static str> {
+        validate_identifier(self.table.schema.as_deref().unwrap_or("dbo"))
+            .map_err(|_| "table.schema must be a valid identifier")?;
+        validate_identifier(&self.table.name)
+            .map_err(|_| "table.name must be a valid identifier")?;
+        let limit = self.limit.unwrap_or(5);
+        if !(1..=25).contains(&limit) {
+            return Err("limit must be between 1 and 25");
+        }
+        Ok(limit)
     }
 }
 
@@ -230,14 +322,24 @@ pub struct DescribeTable {
     pub offset: u32,
 }
 
-const DESCRIBE_COLUMNS: [(&str, &str); 7] = [
+const DESCRIBE_COLUMNS: [(&str, &str); 8] = [
     ("name", "CONVERT(nvarchar(128), c.name)"),
-    ("type", "CONVERT(nvarchar(128), TYPE_NAME(c.user_type_id))"),
-    ("max_length", "CONVERT(nvarchar(20), c.max_length)"),
+    (
+        "type",
+        "CONVERT(nvarchar(128), COALESCE(TYPE_NAME(c.user_type_id), TYPE_NAME(c.system_type_id)))",
+    ),
+    (
+        "max_length",
+        "CONVERT(nvarchar(20), CASE WHEN c.system_type_id IN (231, 239) AND c.max_length >= 0 THEN c.max_length / 2 ELSE c.max_length END)",
+    ),
     ("precision", "CONVERT(nvarchar(20), c.precision)"),
     ("scale", "CONVERT(nvarchar(20), c.scale)"),
     ("is_nullable", "CONVERT(nvarchar(5), c.is_nullable)"),
     ("ordinal", "CONVERT(nvarchar(20), c.column_id)"),
+    (
+        "base_type",
+        "CONVERT(nvarchar(128), TYPE_NAME(c.system_type_id))",
+    ),
 ];
 
 impl DescribeTable {
@@ -264,7 +366,7 @@ impl DescribeTable {
 pub struct InsertRow {
     /// Table or view that receives the row.
     pub table: Table,
-    /// Column values to insert, 1–16 entries.
+    /// Column values to insert, 1–16 entries. SQL Server can implicitly convert numbers to text; use JSON strings to specify the exact text.
     pub values: BTreeMap<String, Value>,
 }
 
@@ -376,11 +478,13 @@ impl Binder {
     }
 }
 
+const INTEGER_RANGE_ERROR: &str = "integer exceeds signed 64-bit range; pass it as a string";
+
 fn validate_value(value: &Value) -> Result<(), &'static str> {
     match value {
         Value::Null | Value::Bool(_) => Ok(()),
         Value::Number(number) if number.is_i64() || number.is_f64() => Ok(()),
-        Value::Number(_) => Err("integer exceeds signed 64-bit range; pass it as a string"),
+        Value::Number(_) => Err(INTEGER_RANGE_ERROR),
         Value::String(text) if text.len() <= MAX_TEXT_BYTES => Ok(()),
         Value::String(_) => Err("string value must be at most 16384 bytes"),
         Value::Array(_) | Value::Object(_) => {
@@ -435,9 +539,16 @@ fn where_clause(
     Ok(format!(" WHERE {}", predicates.join(" AND ")))
 }
 
-fn projected(column: &str) -> String {
+fn projected(column: &str, base_type: Option<&str>) -> String {
     let quoted = quote(column);
-    format!("LEFT(CONVERT(nvarchar(max), {quoted}, 126), {MAX_TEXT_UNITS}) AS {quoted}")
+    let conversion = match base_type {
+        Some("binary" | "varbinary" | "image" | "timestamp" | "rowversion") => {
+            format!("CONVERT(varchar(max), {quoted}, 2)")
+        }
+        Some("xml") => format!("CONVERT(nvarchar(max), {quoted})"),
+        _ => format!("CONVERT(nvarchar(max), {quoted}, 126)"),
+    };
+    format!("LEFT({conversion}, {MAX_TEXT_UNITS}) AS {quoted}")
 }
 
 fn projection(columns: &[(&str, &str)]) -> String {
