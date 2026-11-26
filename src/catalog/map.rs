@@ -264,6 +264,15 @@ struct MapFilter {
 }
 
 impl MapFilter {
+    /// Object types the map may return: a table filter excludes routines.
+    fn table_types(&self) -> String {
+        if self.table.is_some() {
+            self.include.table_types()
+        } else {
+            self.include.object_types()
+        }
+    }
+
     fn predicate(
         &self,
         binder: &mut Binder,
@@ -350,6 +359,8 @@ impl Kind {
 
     fn selected(filter: &MapFilter) -> Vec<Self> {
         let mut kinds = vec![Self::Schema, Self::Object];
+        // A table filter names one table or view, so routine kinds cannot match.
+        let routines = filter.include.has_routine() && filter.table.is_none();
         if filter.include.has_table_or_view() {
             kinds.push(Self::Column);
         }
@@ -363,7 +374,7 @@ impl Kind {
             kinds.push(Self::Index);
             kinds.push(Self::IndexColumn);
         }
-        if filter.include.has_routine() {
+        if routines {
             kinds.push(Self::Parameter);
         }
         kinds
@@ -413,7 +424,7 @@ fn schema_sql(filter: &MapFilter, binder: &mut Binder) -> Result<KindSql, &'stat
             .map(|(_, name)| Value::String(name.clone()))
             .unwrap_or(Value::Null),
     )?;
-    let types = filter.include.object_types();
+    let types = filter.table_types();
     let mut exists = vec![
         "o.is_ms_shipped = 0".to_owned(),
         format!("o.type IN ({types})"),
@@ -428,8 +439,7 @@ fn schema_sql(filter: &MapFilter, binder: &mut Binder) -> Result<KindSql, &'stat
         "FROM sys.schemas AS s \
          WHERE s.name NOT IN (N'sys', N'INFORMATION_SCHEMA') \
            AND (({schema} IS NULL AND {table_schema} IS NULL) \
-             OR ({schema} IS NOT NULL AND s.name = {schema}) \
-             OR ({table_schema} IS NOT NULL AND s.name = {table_schema}) \
+             OR ({table_schema} IS NULL AND s.name = {schema}) \
              OR EXISTS (SELECT 1 FROM sys.objects AS o \
                         WHERE o.schema_id = s.schema_id AND {}))",
         exists.join(" AND ")
@@ -444,7 +454,7 @@ fn schema_sql(filter: &MapFilter, binder: &mut Binder) -> Result<KindSql, &'stat
 }
 
 fn object_sql(filter: &MapFilter, binder: &mut Binder) -> Result<KindSql, &'static str> {
-    let types = filter.include.object_types();
+    let types = filter.table_types();
     let predicate = filter.predicate(binder, "s.name", "o.name", "o.type", &types)?;
     let from_where = format!(
         "FROM sys.objects AS o \
@@ -913,6 +923,23 @@ mod tests {
     }
 
     #[test]
+    fn a_table_filter_only_lists_schemas_that_hold_that_table() {
+        let (sql, parameters) = page_sql(
+            map(serde_json::json!({"table": {"schema": "Sales", "name": "Orders"}})),
+            "schema",
+        );
+        assert!(sql.contains("o.name = "), "{sql}");
+        assert!(
+            !sql.contains("AND s.name = ") || sql.contains("o.name = "),
+            "the schema page must not match on the schema name alone: {sql}"
+        );
+        assert!(
+            parameters.iter().any(|value| value == "Orders"),
+            "{parameters:?}"
+        );
+    }
+
+    #[test]
     fn the_full_map_selects_all_kinds_and_binds_the_table_filter() {
         let input = map(serde_json::json!({
             "table": {"schema": "Weird Schema'; DROP TABLE x;--", "name": "Items"},
@@ -920,6 +947,7 @@ mod tests {
         }));
         let plan = input.plan().expect("plan");
         assert_eq!(plan.limit, 7);
+        // A table filter names one table or view, so routine kinds cannot match.
         assert_eq!(
             plan.pages.iter().map(|page| page.kind).collect::<Vec<_>>(),
             [
@@ -932,8 +960,23 @@ mod tests {
                 "foreign_key_column",
                 "index",
                 "index_column",
-                "parameter",
             ]
+        );
+        let object = page_sql(
+            map(serde_json::json!({"table": {"name": "Items"}})),
+            "object",
+        )
+        .0;
+        assert!(object.contains("o.type IN (N'U', N'V')"), "{object}");
+        let unfiltered = map(serde_json::json!({}));
+        assert!(
+            unfiltered
+                .plan()
+                .expect("plan")
+                .pages
+                .iter()
+                .any(|page| page.kind == "parameter"),
+            "an unfiltered map still lists routine parameters"
         );
         for page in &plan.pages {
             assert!(!page.sql.contains("Weird Schema"), "{}", page.sql);
