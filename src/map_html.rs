@@ -21,10 +21,23 @@ pub(super) struct Diagram<'a> {
     pub expressions_truncated: bool,
 }
 
-const NODE_X: usize = 28;
-const NODE_WIDTH: usize = 270;
+const NODE_WIDTH: usize = 230;
 const NODE_HEIGHT: usize = 54;
-const EDGE_X: usize = NODE_X + NODE_WIDTH;
+const SCHEMA_COLUMNS: usize = 3;
+const SCHEMA_PADDING: usize = 14;
+const SCHEMA_HEADER: usize = 34;
+const COLUMN_GAP: usize = 14;
+const ROW_GAP: usize = 26;
+const FRAME_X: usize = 12;
+const FRAME_GAP: usize = 16;
+const LANE_GAP: usize = 9;
+/// Distance above a row gap's centre where a horizontal run feeds into a box.
+const GAP_INTO_ROW: usize = 6;
+
+/// Horizontal band between two rows of boxes, where an edge can run.
+fn row_gap_y(node_y: usize) -> usize {
+    node_y + NODE_HEIGHT + ROW_GAP / 2
+}
 
 const DOCUMENT: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -70,8 +83,45 @@ pub(super) fn render(map: &Diagram<'_>) -> String {
         html.push_str("<p>No visible tables matched the selection.</p></main></body></html>\n");
         return html;
     }
-    let width = EDGE_X + 64 + map.edges.len() * 11;
-    let height = 26 + 64 * schemas.len() + (NODE_HEIGHT + 8) * map.nodes.len();
+    let mut positions = BTreeMap::<i32, (usize, usize, usize)>::new();
+    let mut frames = Vec::new();
+    let mut nodes = Vec::new();
+    let mut top = 12;
+    let mut widest = 0;
+    for (schema, tables) in &schemas {
+        let columns = tables.len().clamp(1, SCHEMA_COLUMNS);
+        let rows = tables.len().div_ceil(columns);
+        let frame_width =
+            SCHEMA_PADDING * 2 + columns * NODE_WIDTH + columns.saturating_sub(1) * COLUMN_GAP;
+        let frame_height = SCHEMA_HEADER + rows * (NODE_HEIGHT + ROW_GAP);
+        widest = widest.max(frame_width);
+        frames.push((schema, top, frame_width, frame_height));
+        for (index, (id, node)) in tables.iter().enumerate() {
+            let x = FRAME_X + SCHEMA_PADDING + (index % columns) * (NODE_WIDTH + COLUMN_GAP);
+            let y = top + SCHEMA_HEADER + (index / columns) * (NODE_HEIGHT + ROW_GAP);
+            positions.insert(*id, (x, y, row_gap_y(y)));
+            nodes.push(node_markup(node, x, y));
+        }
+        top += frame_height + FRAME_GAP;
+    }
+
+    // One lane per table pair keeps repeated constraints readable. Lanes live in
+    // a gutter right of every frame, and the horizontal runs stay inside the row
+    // gaps, so no line crosses a table box.
+    let mut lanes = BTreeMap::<(i32, i32), Vec<&Edge<'_>>>::new();
+    for edge in &map.edges {
+        if positions.contains_key(&edge.child) && positions.contains_key(&edge.referenced) {
+            lanes
+                .entry((edge.child, edge.referenced))
+                .or_default()
+                .push(edge);
+        }
+    }
+    let mut ordered = lanes.into_iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|((child, referenced), _)| (*referenced, *child));
+    let gutter = FRAME_X + widest + 24;
+    let width = gutter + 8 + ordered.len().max(1) * LANE_GAP;
+    let height = top + 4;
     let _ = writeln!(
         html,
         r#"<figure><div class="canvas" role="region" aria-label="Scrollable diagram" tabindex="0">
@@ -79,61 +129,46 @@ pub(super) fn render(map: &Diagram<'_>) -> String {
 <title>Tables grouped by schema, with foreign keys pointing to the referenced table</title>
 <defs><marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 Z"/></marker></defs>"#
     );
-
-    let mut positions = BTreeMap::<i32, usize>::new();
-    let mut top = 12;
-    for (schema, tables) in &schemas {
-        let group_height = 50 + (NODE_HEIGHT + 8) * tables.len();
-        let label_y = top + 24;
+    for (schema, frame_top, frame_width, frame_height) in &frames {
+        let label_y = frame_top + 24;
         let _ = writeln!(
             html,
-            r#"<rect class="schema-frame" x="12" y="{top}" width="{}" height="{group_height}" rx="8"/>
-<text class="label" x="{NODE_X}" y="{label_y}"><title>{}</title>{}</text>"#,
-            NODE_WIDTH + 32,
+            r#"<rect class="schema-frame" x="{FRAME_X}" y="{frame_top}" width="{frame_width}" height="{frame_height}" rx="8"/>
+<text class="label" x="{}" y="{label_y}"><title>{}</title>{}</text>"#,
+            FRAME_X + SCHEMA_PADDING,
             escape(schema),
             short_label(schema)
         );
-        let mut y = top + 36;
-        for (id, node) in tables {
-            positions.insert(*id, y);
-            let border_class = if node.columns.is_some() {
-                "node"
-            } else {
-                "node external"
-            };
-            let details = node.columns.map_or_else(
-                || "External table".to_owned(),
-                |count| format!("{count} columns"),
-            );
-            let _ = writeln!(
-                html,
-                r#"<g><title>{}.{}</title><rect class="{border_class}" x="{NODE_X}" y="{y}" width="{NODE_WIDTH}" height="{NODE_HEIGHT}" rx="5"/>
-<text class="label" x="40" y="{}">{}</text><text class="metadata" x="40" y="{}">{details}</text></g>"#,
-                escape(node.schema),
-                escape(node.table),
-                y + 21,
-                short_label(node.table),
-                y + 40
-            );
-            y += NODE_HEIGHT + 8;
-        }
-        top += group_height + 14;
     }
-    for (index, edge) in map.edges.iter().enumerate() {
-        if let (Some(child), Some(target)) =
-            (positions.get(&edge.child), positions.get(&edge.referenced))
-        {
-            let lane = EDGE_X + 38 + index * 11;
-            let child_y = child + 19;
-            let target_y = target + 36;
-            let _ = writeln!(
-                html,
-                r#"<path class="edge" marker-end="url(#arrow)" d="M{EDGE_X} {child_y} H{lane} V{target_y} H{EDGE_X}"><title>{}</title></path>"#,
-                escape(edge.name)
-            );
-        }
+    for markup in &nodes {
+        html.push_str(markup);
     }
-    html.push_str("</svg></div><figcaption>Arrows point from the child table to the referenced table. Scroll the diagram to see all lanes.</figcaption></figure>\n<h2>Tables by schema</h2>\n");
+    for (index, ((child, referenced), edges)) in ordered.iter().enumerate() {
+        let (Some((child_x, child_y, child_gap)), Some((target_x, _, target_gap))) =
+            (positions.get(child), positions.get(referenced))
+        else {
+            continue;
+        };
+        let lane = gutter + index * LANE_GAP;
+        let names = edges
+            .iter()
+            .map(|edge| escape(edge.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let exit_x = child_x + NODE_WIDTH / 2;
+        let entry_x = target_x + NODE_WIDTH / 2;
+        let _ = writeln!(
+            html,
+            r#"<path class="edge" marker-end="url(#arrow)" d="M{exit_x} {} V{child_gap} H{lane} V{target_gap} H{entry_x} V{}"><title>{names}</title></path>"#,
+            child_y + NODE_HEIGHT,
+            target_gap - GAP_INTO_ROW
+        );
+    }
+    let _ = writeln!(
+        html,
+        "</svg></div><figcaption>Each arrow leaves the bottom of a child table and enters the table it references. Tables outside the selection are dashed. Scroll the diagram in both directions; {} lanes are ordered by target.</figcaption></figure>\n<h2>Tables by schema</h2>",
+        ordered.len()
+    );
     for (schema, tables) in &schemas {
         let _ = writeln!(html, "<h3>{}</h3><ul>", escape(schema));
         for (_, node) in tables {
@@ -179,6 +214,30 @@ pub(super) fn render(map: &Diagram<'_>) -> String {
     }
     html.push_str("</main></body></html>\n");
     html
+}
+
+fn node_markup(node: &Node<'_>, x: usize, y: usize) -> String {
+    let border_class = if node.columns.is_some() {
+        "node"
+    } else {
+        "node external"
+    };
+    let details = node.columns.map_or_else(
+        || "External table".to_owned(),
+        |count| format!("{count} columns"),
+    );
+    format!(
+        r#"<g><title>{}.{}</title><rect class="{border_class}" x="{x}" y="{y}" width="{NODE_WIDTH}" height="{NODE_HEIGHT}" rx="5"/>
+<text class="label" x="{}" y="{}">{}</text><text class="metadata" x="{}" y="{}">{details}</text></g>
+"#,
+        escape(node.schema),
+        escape(node.table),
+        x + 12,
+        y + 21,
+        short_label(node.table),
+        x + 12,
+        y + 40
+    )
 }
 
 fn short_label(text: &str) -> String {
