@@ -199,6 +199,66 @@ fn stdio_transport_ignores_an_http_token() {
 }
 
 #[test]
+fn yolo_is_accepted_in_every_mode_and_keeps_check_config_identical() {
+    let read_output = b"Configuration valid (auth=sql, mode=read)\n";
+    let baseline = run(&[CONNECTION, &["--check-config"]].concat(), &sql_env(None));
+    assert_eq!(baseline.status.code(), Some(0));
+    assert_eq!(baseline.stdout, read_output);
+    assert!(baseline.stderr.is_empty());
+
+    // The opt-out is accepted in every mode but never changes the validation
+    // report: only the effective auth and mode are printed.
+    for mode in ["read", "write", "both"] {
+        let with_yolo = run(
+            &[CONNECTION, &["--mode", mode, "--yolo", "--check-config"]].concat(),
+            &sql_env(None),
+        );
+        let without_yolo = run(
+            &[CONNECTION, &["--mode", mode, "--check-config"]].concat(),
+            &sql_env(None),
+        );
+        assert_eq!(with_yolo.status.code(), Some(0), "{mode} mode");
+        assert_eq!(with_yolo.stdout, without_yolo.stdout, "{mode} mode");
+        assert_eq!(with_yolo.stderr, without_yolo.stderr, "{mode} mode");
+        assert!(with_yolo.stderr.is_empty(), "{mode} mode");
+    }
+
+    // The environment variable is a boolean: true turns it on, false keeps the
+    // default, and anything else is rejected instead of being guessed.
+    for value in ["true", "false"] {
+        let mut env = sql_env(None);
+        env.push(("MSSQL_MCP_YOLO", value));
+        let out = run(&[CONNECTION, &["--check-config"]].concat(), &env);
+        assert_eq!(out.status.code(), Some(0), "MSSQL_MCP_YOLO={value}");
+        assert_eq!(out.stdout, read_output, "MSSQL_MCP_YOLO={value}");
+        assert!(out.stderr.is_empty(), "MSSQL_MCP_YOLO={value}");
+    }
+
+    let mut env = sql_env(None);
+    env.push(("MSSQL_MCP_YOLO", "maybe"));
+    let out = run(&[CONNECTION, &["--check-config"]].concat(), &env);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("invalid value 'maybe'") && stderr.contains("--yolo"),
+        "the invalid boolean must be reported: {stderr}"
+    );
+}
+
+#[test]
+fn help_documents_the_yolo_opt_out() {
+    let out = run(&["--help"], &[]);
+    assert_eq!(out.status.code(), Some(0));
+    let help = String::from_utf8(out.stdout).expect("help output is UTF-8");
+    assert!(help.contains("--yolo"), "help must document --yolo: {help}");
+    assert!(
+        help.contains("MSSQL_MCP_YOLO"),
+        "help must document the yolo environment variable: {help}"
+    );
+}
+
+#[test]
 fn help_documents_the_loopback_default() {
     let out = run(&["--help"], &[]);
     assert_eq!(out.status.code(), Some(0));

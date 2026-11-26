@@ -1,6 +1,9 @@
+pub mod approval;
 pub mod audit;
 pub mod config;
 pub mod database;
 pub mod http;
+pub mod query;
+pub mod schema;
 pub mod server;
 pub mod statement;

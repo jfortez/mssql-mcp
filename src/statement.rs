@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 const DEFAULT_LIMIT: u16 = 25;
-const MAX_ROWS: u16 = 100;
+pub(crate) const MAX_ROWS: u16 = 100;
 const MAX_ENTRIES: usize = 16;
 const PAGE_SIZE: u16 = 100;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -13,11 +13,57 @@ const MAX_TEXT_UNITS: usize = 1025;
 const IDENTIFIER_ERROR: &str =
     "identifier must contain 1–128 UTF-16 units and no control characters";
 
+/// How the database layer decodes the batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Execution {
+    /// At most one result set, bounded like a read.
+    Rows,
+    /// The generated mutation status shape with `affected_rows`.
+    Status,
+    /// One arbitrary batch: zero result sets or one bounded result set.
+    Batch,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Statement {
     pub sql: String,
     pub parameters: Vec<Value>,
     pub mutation: bool,
+    pub(crate) execution: Execution,
+    pub(crate) limit: usize,
+}
+
+impl Statement {
+    pub fn read(sql: String, parameters: Vec<Value>, limit: usize) -> Self {
+        Self {
+            sql,
+            parameters,
+            mutation: false,
+            execution: Execution::Rows,
+            limit: limit.clamp(1, usize::from(MAX_ROWS)),
+        }
+    }
+
+    pub fn status(sql: String, parameters: Vec<Value>) -> Self {
+        Self {
+            sql,
+            parameters,
+            mutation: true,
+            execution: Execution::Status,
+            limit: usize::from(MAX_ROWS),
+        }
+    }
+
+    /// One raw batch with no generated wrapper and no affected-row guard.
+    pub fn batch(sql: String, limit: usize) -> Self {
+        Self {
+            sql,
+            parameters: Vec::new(),
+            mutation: true,
+            execution: Execution::Batch,
+            limit: limit.clamp(1, usize::from(MAX_ROWS)),
+        }
+    }
 }
 
 /// Table or view addressed by schema-qualified name.
@@ -129,11 +175,7 @@ impl SelectRows {
                 " ORDER BY {order} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
             ));
         }
-        Ok(Statement {
-            sql,
-            parameters: binder.parameters,
-            mutation: false,
-        })
+        Ok(Statement::read(sql, binder.parameters, usize::from(limit)))
     }
 }
 
@@ -170,11 +212,11 @@ impl ListTables {
             "SELECT {} FROM sys.objects AS o JOIN sys.schemas AS s ON s.schema_id = o.schema_id WHERE o.is_ms_shipped = 0 AND o.type IN (N'U', N'V'){schema} ORDER BY s.name, o.name OFFSET {offset} ROWS FETCH NEXT {PAGE_SIZE} ROWS ONLY",
             projection(&LIST_TABLE_COLUMNS),
         );
-        Ok(Statement {
+        Ok(Statement::read(
             sql,
-            parameters: binder.parameters,
-            mutation: false,
-        })
+            binder.parameters,
+            usize::from(MAX_ROWS),
+        ))
     }
 }
 
@@ -209,11 +251,11 @@ impl DescribeTable {
             "SELECT {} FROM sys.columns AS c JOIN sys.objects AS o ON o.object_id = c.object_id JOIN sys.schemas AS s ON s.schema_id = o.schema_id WHERE o.is_ms_shipped = 0 AND o.type IN (N'U', N'V') AND s.name = {schema} AND o.name = {name} ORDER BY c.column_id OFFSET {offset} ROWS FETCH NEXT {PAGE_SIZE} ROWS ONLY",
             projection(&DESCRIBE_COLUMNS),
         );
-        Ok(Statement {
+        Ok(Statement::read(
             sql,
-            parameters: binder.parameters,
-            mutation: false,
-        })
+            binder.parameters,
+            usize::from(MAX_ROWS),
+        ))
     }
 }
 
@@ -318,20 +360,16 @@ fn mutation_statement(body: String, binder: &Binder) -> Statement {
     let sql = format!(
         "SET NOCOUNT ON; SET XACT_ABORT ON; BEGIN TRANSACTION;\n{body};\n{guard}\n{affected}"
     );
-    Statement {
-        sql,
-        parameters: binder.parameters.clone(),
-        mutation: true,
-    }
+    Statement::status(sql, binder.parameters.clone())
 }
 
 #[derive(Default)]
-struct Binder {
-    parameters: Vec<Value>,
+pub(crate) struct Binder {
+    pub(crate) parameters: Vec<Value>,
 }
 
 impl Binder {
-    fn bind(&mut self, value: Value) -> Result<String, &'static str> {
+    pub(crate) fn bind(&mut self, value: Value) -> Result<String, &'static str> {
         validate_value(&value)?;
         self.parameters.push(value);
         Ok(format!("@P{}", self.parameters.len()))
@@ -351,7 +389,7 @@ fn validate_value(value: &Value) -> Result<(), &'static str> {
     }
 }
 
-fn validate_identifier(value: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_identifier(value: &str) -> Result<(), &'static str> {
     if value.is_empty() || value.encode_utf16().count() > 128 || value.chars().any(char::is_control)
     {
         return Err(IDENTIFIER_ERROR);

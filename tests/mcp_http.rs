@@ -27,8 +27,19 @@ const IO_TIMEOUT: Duration = Duration::from_secs(20);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 
-const READ_TOOLS: [&str; 3] = ["list_tables", "describe_table", "select_rows"];
-const WRITE_TOOLS: [&str; 3] = ["insert_row", "update_rows", "delete_rows"];
+const READ_TOOLS: [&str; 4] = [
+    "list_tables",
+    "describe_table",
+    "select_rows",
+    "explore_schema",
+];
+const WRITE_TOOLS: [&str; 5] = [
+    "insert_row",
+    "update_rows",
+    "delete_rows",
+    "query",
+    "explore_schema",
+];
 
 #[test]
 fn one_daemon_serves_independent_clients() {
@@ -299,6 +310,55 @@ fn mode_gates_apply_to_the_http_transport() {
 }
 
 #[test]
+fn mutations_need_approval_over_http_and_fail_closed() {
+    let daemon = Daemon::start("write");
+    let started = Instant::now();
+    let response = send(
+        daemon.addr,
+        authorized(tools_call_with(
+            2,
+            "insert_row",
+            json!({"table": {"name": "Items"}, "values": {"id": 1}}),
+        )),
+    );
+    assert_eq!(response.status, 200, "{}", response.text());
+    let result = response.json()["result"].clone();
+    let error = &result["structuredContent"];
+    assert_eq!(result["isError"], true, "{result}");
+    assert_eq!(error["code"], "approval_unavailable", "{result}");
+    assert_eq!(error["mutation_outcome"], "not_attempted", "{result}");
+    assert_eq!(error["retryable"], false, "{result}");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("--yolo") && text.contains("elicitation")),
+        "the refusal must name both remedies: {result}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a stateless HTTP transport cannot elicit, so the gate must fail closed without waiting for the 120 s timeout"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline
+        && !daemon
+            .stderr_text()
+            .contains("\"approval\":\"unavailable\"")
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let stderr = daemon.stderr_text();
+    assert_eq!(
+        stderr.matches("\"event\":\"tool_call\"").count(),
+        1,
+        "the refused mutation must still be audited: {stderr}"
+    );
+    assert!(
+        stderr.contains("\"approval\":\"unavailable\""),
+        "the audit record must carry the approval outcome: {stderr}"
+    );
+}
+
+#[test]
 fn request_bodies_are_bounded_to_one_mebibyte() {
     let daemon = Daemon::start("read");
 
@@ -374,7 +434,12 @@ fn concurrent_clients_share_the_same_daemon() {
 #[test]
 fn an_explicit_non_loopback_bind_is_served_with_authentication() {
     let bind = SocketAddr::from(([0, 0, 0, 0], free_loopback_port()));
-    let daemon = Daemon::start_on(bind, "read");
+    let mut daemon = Daemon::start_on(bind, "read");
+    assert!(
+        daemon.is_running(),
+        "the daemon exited before serving: {}",
+        daemon.stderr_text()
+    );
 
     let response = send(daemon.addr, authorized(initialize(1, "docker-client")));
     assert_eq!(
@@ -618,11 +683,15 @@ fn tools_list(id: u64) -> Value {
 }
 
 fn tools_call(id: u64, tool: &str) -> Value {
+    tools_call_with(id, tool, json!({}))
+}
+
+fn tools_call_with(id: u64, tool: &str, arguments: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "tools/call",
-        "params": {"name": tool, "arguments": {}}
+        "params": {"name": tool, "arguments": arguments}
     })
 }
 
@@ -730,7 +799,7 @@ fn send(addr: SocketAddr, outgoing: Outgoing) -> Response {
     match pending.join().expect("response reader") {
         Ok(response) => response,
         Err(error) => {
-            panic!("no HTTP response from the daemon: {error} (write result: {written:?})")
+            panic!("no HTTP response from {addr} after writing {written:?}: {error}")
         }
     }
 }

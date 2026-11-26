@@ -4,8 +4,9 @@
 //! record has an epoch-millisecond `ts` and an `event`: `startup` and
 //! `shutdown` describe the process, and `tool_call` describes one completed
 //! call with a known tool name, the effective mode, a status and code, the
-//! duration, the validated scope and bounded result counts. Values, SQL text,
-//! credentials and unvalidated identifiers are never recorded.
+//! duration, the validated scope, bounded result counts and, for mutations, the
+//! approval outcome. Values, SQL text, credentials, filter contents and
+//! unvalidated identifiers are never recorded.
 
 use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,7 +31,7 @@ impl Status {
 }
 
 /// Validated object scope of a tool call; absent when validation did not run.
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 pub struct Scope<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     schema: Option<&'a str>,
@@ -76,6 +77,9 @@ pub struct CallRecord<'a> {
     pub rows: Option<usize>,
     pub affected_rows: Option<i64>,
     pub truncated: Option<bool>,
+    /// Approval outcome of a mutation that reached the gate; absent for reads
+    /// and for refusals that happened before the gate.
+    pub approval: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -113,6 +117,8 @@ struct ToolCallRecord<'a> {
     affected_rows: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval: Option<&'static str>,
 }
 
 pub fn startup(mode: Mode, auth: &str, tls_verify: bool) {
@@ -146,6 +152,7 @@ pub fn call(record: CallRecord<'_>) {
         rows: record.rows,
         affected_rows: record.affected_rows,
         truncated: record.truncated,
+        approval: record.approval,
     });
 }
 

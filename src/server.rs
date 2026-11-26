@@ -6,15 +6,18 @@ use rmcp::handler::server::common::schema_for_input;
 use rmcp::model::{
     CallToolRequestMethod, CallToolRequestParams, CallToolResponse, CallToolResult, ConstString,
     ContentBlock, ErrorCode, Implementation, JsonObject, ListToolsResult, PaginatedRequestParams,
-    ServerCapabilities, ServerConfig, Tool,
+    ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer, ServerInitializeError};
 use rmcp::transport::async_rw::AsyncRwTransport;
 use serde_json::{Value, json};
 
+use crate::approval::{self, Approves, Decision, Subject};
 use crate::audit::{self, Scope, Status};
 use crate::config::{Mode, Settings, Transport};
 use crate::database::{Database, DbError, Outcome};
+use crate::query::Query;
+use crate::schema::{Catalog, ExploreSchema};
 use crate::statement::{
     DeleteRows, DescribeTable, InsertRow, ListTables, SelectRows, Statement, Table, UpdateRows,
 };
@@ -33,6 +36,8 @@ const QUERY_FAILED: &str = "query_failed";
 const TIMEOUT: &str = "timeout";
 const UNRECOGNIZED_RESULT: &str = "unrecognized_result";
 const MUTATION_ROLLED_BACK_CODE: &str = "mutation_rolled_back";
+const APPROVAL_DENIED: &str = "approval_denied";
+const APPROVAL_UNAVAILABLE: &str = "approval_unavailable";
 
 const NOT_ATTEMPTED: &str = "not_attempted";
 const ROLLED_BACK: &str = "rolled_back";
@@ -49,6 +54,14 @@ const RETRY_READ_ACTION: &str =
     "check the database permissions and the requested objects, then retry";
 const VERIFY_STATE_ACTION: &str = "verify the database state before retrying the operation";
 const ROLLBACK_ACTION: &str = "narrow the filters so at most 100 rows change, then retry";
+const APPROVAL_ACTION: &str =
+    "accept the approval prompt for the mutation, or start the server with --yolo";
+const APPROVAL_UNAVAILABLE_ACTION: &str =
+    "use a client that supports MCP elicitation, or start the server with --yolo";
+const APPROVAL_UNAVAILABLE_MESSAGE: &str = concat!(
+    "the client cannot approve mutations; use a client that supports elicitation ",
+    "or start the server with --yolo"
+);
 
 #[derive(Clone, Copy)]
 enum Known {
@@ -58,15 +71,19 @@ enum Known {
     InsertRow,
     UpdateRows,
     DeleteRows,
+    Query,
+    ExploreSchema,
 }
 
-const KNOWN: [Known; 6] = [
+const KNOWN: [Known; 8] = [
     Known::ListTables,
     Known::DescribeTable,
     Known::SelectRows,
     Known::InsertRow,
     Known::UpdateRows,
     Known::DeleteRows,
+    Known::Query,
+    Known::ExploreSchema,
 ];
 
 impl Known {
@@ -78,17 +95,33 @@ impl Known {
             Self::InsertRow => "insert_row",
             Self::UpdateRows => "update_rows",
             Self::DeleteRows => "delete_rows",
+            Self::Query => "query",
+            Self::ExploreSchema => "explore_schema",
         }
     }
 
+    /// Tools that may change the database and therefore ask for approval.
     const fn is_mutation(self) -> bool {
-        matches!(self, Self::InsertRow | Self::UpdateRows | Self::DeleteRows)
+        matches!(
+            self,
+            Self::InsertRow | Self::UpdateRows | Self::DeleteRows | Self::Query
+        )
     }
 
     const fn allowed(self, mode: Mode) -> bool {
         match mode {
-            Mode::Read => !self.is_mutation(),
-            Mode::Write => self.is_mutation(),
+            Mode::Read => matches!(
+                self,
+                Self::ListTables | Self::DescribeTable | Self::SelectRows | Self::ExploreSchema
+            ),
+            Mode::Write => matches!(
+                self,
+                Self::InsertRow
+                    | Self::UpdateRows
+                    | Self::DeleteRows
+                    | Self::Query
+                    | Self::ExploreSchema
+            ),
             Mode::Both => true,
         }
     }
@@ -184,6 +217,26 @@ impl ToolError {
         }
     }
 
+    fn approval_denied() -> Self {
+        Self {
+            code: APPROVAL_DENIED,
+            message: "the mutation was not approved".to_owned(),
+            action: APPROVAL_ACTION,
+            retryable: false,
+            mutation_outcome: Some(NOT_ATTEMPTED),
+        }
+    }
+
+    fn approval_unavailable() -> Self {
+        Self {
+            code: APPROVAL_UNAVAILABLE,
+            message: APPROVAL_UNAVAILABLE_MESSAGE.to_owned(),
+            action: APPROVAL_UNAVAILABLE_ACTION,
+            retryable: false,
+            mutation_outcome: Some(NOT_ATTEMPTED),
+        }
+    }
+
     fn from_database(error: DbError, mutation: bool) -> Self {
         let (code, action, retryable) = match error {
             DbError::Busy => (DATABASE_BUSY, BUSY_ACTION, true),
@@ -244,27 +297,33 @@ fn rolled_back() -> CallToolResult {
     result
 }
 
+/// Bounded result details of one call; `approval` is set only for mutations
+/// that reached the gate.
 #[derive(Default)]
-struct Counts {
+struct Details {
     rows: Option<usize>,
     affected_rows: Option<i64>,
     truncated: Option<bool>,
+    approval: Option<&'static str>,
 }
 
 pub struct McpServer {
     database: Database,
     mode: Mode,
+    yolo: bool,
     tools: Vec<Tool>,
 }
 
 impl McpServer {
     pub fn new(settings: Settings) -> Result<Self, &'static str> {
         let mode = settings.mode;
+        let yolo = settings.yolo;
         let database = Database::new(Arc::new(settings));
         let tools = build_tools()?;
         Ok(Self {
             database,
             mode,
+            yolo,
             tools,
         })
     }
@@ -273,25 +332,68 @@ impl McpServer {
         &self,
         tool: Known,
         arguments: JsonObject,
+        context: &RequestContext<RoleServer>,
         started: Instant,
         prepare: impl FnOnce(&T) -> Result<Statement, &'static str>,
     ) -> CallToolResult
     where
-        T: serde::de::DeserializeOwned + Scoped + Send,
+        T: serde::de::DeserializeOwned + Scoped + Approves + Send,
     {
         let name = tool.name();
         let input = match serde_json::from_value(Value::Object(arguments)) {
             Ok(input) => input,
-            Err(_) => return self.failed(name, started, None, ToolError::invalid_arguments(tool)),
+            Err(_) => {
+                return self.failed(
+                    name,
+                    started,
+                    None,
+                    ToolError::invalid_arguments(tool),
+                    None,
+                );
+            }
         };
         let statement = match prepare(&input) {
             Ok(statement) => statement,
             Err(message) => {
-                return self.failed(name, started, None, ToolError::invalid_input(tool, message));
+                return self.failed(
+                    name,
+                    started,
+                    None,
+                    ToolError::invalid_input(tool, message),
+                    None,
+                );
             }
         };
         let mutation = statement.mutation;
         let scope = input.scope();
+        // Approval runs before any connection is opened, so a database failure
+        // can never be mistaken for an approval failure.
+        let approval = if mutation {
+            let decision = match input.approval() {
+                Some(subject) => {
+                    match self
+                        .approve(name, &subject, context, started, Some(scope))
+                        .await
+                    {
+                        Ok(decision) => decision,
+                        Err(result) => return result,
+                    }
+                }
+                None => {
+                    let error = ToolError::approval_unavailable();
+                    return self.failed(
+                        name,
+                        started,
+                        Some(scope),
+                        error,
+                        Some(Decision::Unavailable.audit_name()),
+                    );
+                }
+            };
+            Some(decision)
+        } else {
+            None
+        };
         match self.database.execute(statement).await {
             Ok(Outcome::Read(read)) => {
                 self.record(
@@ -300,10 +402,11 @@ impl McpServer {
                     Status::Ok,
                     None,
                     Some(scope),
-                    Counts {
+                    Details {
                         rows: Some(read.rows.len()),
                         truncated: Some(read.truncated),
-                        ..Counts::default()
+                        approval,
+                        ..Details::default()
                     },
                 );
                 CallToolResult::structured(json!({
@@ -319,9 +422,10 @@ impl McpServer {
                     Status::Ok,
                     None,
                     Some(scope),
-                    Counts {
+                    Details {
                         affected_rows: Some(affected),
-                        ..Counts::default()
+                        approval,
+                        ..Details::default()
                     },
                 );
                 CallToolResult::structured(json!({"affected_rows": affected}))
@@ -333,20 +437,232 @@ impl McpServer {
                     Status::Error,
                     Some(MUTATION_ROLLED_BACK_CODE),
                     Some(scope),
-                    Counts {
+                    Details {
                         affected_rows: Some(-1),
-                        ..Counts::default()
+                        approval,
+                        ..Details::default()
                     },
                 );
                 rolled_back()
             }
+            Ok(Outcome::Executed) => self.failed(
+                name,
+                started,
+                Some(scope),
+                ToolError::from_database(DbError::UnexpectedResult, mutation),
+                approval,
+            ),
             Err(error) => self.failed(
                 name,
                 started,
                 Some(scope),
                 ToolError::from_database(error, mutation),
+                approval,
             ),
         }
+    }
+
+    /// Ask for approval and map a refusal into the recorded tool error. The
+    /// caller returns the error result when this fails.
+    async fn approve(
+        &self,
+        tool: &'static str,
+        subject: &Subject<'_>,
+        context: &RequestContext<RoleServer>,
+        started: Instant,
+        scope: Option<Scope<'_>>,
+    ) -> Result<&'static str, CallToolResult> {
+        let decision = tokio::select! {
+            decision = approval::gate(&context.peer, subject, self.yolo) => decision,
+            _ = context.ct.cancelled() => {
+                return Err(self.failed(
+                    tool,
+                    started,
+                    scope,
+                    ToolError::approval_denied(),
+                    Some(Decision::Denied.audit_name()),
+                ));
+            }
+        };
+        if context.ct.is_cancelled() {
+            return Err(self.failed(
+                tool,
+                started,
+                scope,
+                ToolError::approval_denied(),
+                Some(decision.audit_name()),
+            ));
+        }
+        if decision.permitted() {
+            return Ok(decision.audit_name());
+        }
+        let error = if decision == Decision::Denied {
+            ToolError::approval_denied()
+        } else {
+            ToolError::approval_unavailable()
+        };
+        Err(self.failed(tool, started, scope, error, Some(decision.audit_name())))
+    }
+
+    /// One raw batch: approval always precedes the connection and the prompt
+    /// carries the exact SQL. No scope can be validated from arbitrary text.
+    async fn query(
+        &self,
+        arguments: JsonObject,
+        context: &RequestContext<RoleServer>,
+        started: Instant,
+    ) -> CallToolResult {
+        let name = Known::Query.name();
+        let input = match serde_json::from_value::<Query>(Value::Object(arguments)) {
+            Ok(input) => input,
+            Err(_) => {
+                return self.failed(
+                    name,
+                    started,
+                    None,
+                    ToolError::invalid_arguments(Known::Query),
+                    None,
+                );
+            }
+        };
+        let statement = match input.prepare() {
+            Ok(statement) => statement,
+            Err(message) => {
+                return self.failed(
+                    name,
+                    started,
+                    None,
+                    ToolError::invalid_input(Known::Query, message),
+                    None,
+                );
+            }
+        };
+        let subject = Subject::batch(name, &input.sql);
+        let approval = match self.approve(name, &subject, context, started, None).await {
+            Ok(decision) => decision,
+            Err(result) => return result,
+        };
+        match self.database.execute(statement).await {
+            Ok(Outcome::Read(read)) => {
+                self.record(
+                    Some(name),
+                    started,
+                    Status::Ok,
+                    None,
+                    None,
+                    Details {
+                        rows: Some(read.rows.len()),
+                        truncated: Some(read.truncated),
+                        approval: Some(approval),
+                        ..Details::default()
+                    },
+                );
+                CallToolResult::structured(json!({
+                    "columns": read.columns,
+                    "rows": read.rows,
+                    "truncated": read.truncated,
+                }))
+            }
+            Ok(Outcome::Executed) => {
+                self.record(
+                    Some(name),
+                    started,
+                    Status::Ok,
+                    None,
+                    None,
+                    Details {
+                        approval: Some(approval),
+                        ..Details::default()
+                    },
+                );
+                CallToolResult::structured(json!({"executed": true}))
+            }
+            Ok(Outcome::Mutation(_)) => self.failed(
+                name,
+                started,
+                None,
+                ToolError::from_database(DbError::UnexpectedResult, true),
+                Some(approval),
+            ),
+            Err(error) => self.failed(
+                name,
+                started,
+                None,
+                ToolError::from_database(error, true),
+                Some(approval),
+            ),
+        }
+    }
+
+    /// Read-only catalog tree: no approval and no arbitrary SQL, available in
+    /// every mode. The scope is recorded only after the schema validates.
+    async fn explore_schema(&self, arguments: JsonObject, started: Instant) -> CallToolResult {
+        let name = Known::ExploreSchema.name();
+        let input = match serde_json::from_value::<ExploreSchema>(Value::Object(arguments)) {
+            Ok(input) => input,
+            Err(_) => {
+                return self.failed(
+                    name,
+                    started,
+                    None,
+                    ToolError::invalid_arguments(Known::ExploreSchema),
+                    None,
+                );
+            }
+        };
+        let plan = match input.plan() {
+            Ok(plan) => plan,
+            Err(message) => {
+                return self.failed(
+                    name,
+                    started,
+                    None,
+                    ToolError::invalid_input(Known::ExploreSchema, message),
+                    None,
+                );
+            }
+        };
+        let scope = match input.schema.as_deref() {
+            Some(schema) => Scope::schema(schema),
+            None => Scope::catalog(),
+        };
+        let mut catalog = Catalog::default();
+        for (part, statement) in plan {
+            match self.database.execute(statement).await {
+                Ok(Outcome::Read(read)) => catalog.absorb(part, read),
+                Ok(_) => {
+                    return self.failed(
+                        name,
+                        started,
+                        Some(scope),
+                        ToolError::from_database(DbError::UnexpectedResult, false),
+                        None,
+                    );
+                }
+                Err(error) => {
+                    return self.failed(
+                        name,
+                        started,
+                        Some(scope),
+                        ToolError::from_database(error, false),
+                        None,
+                    );
+                }
+            }
+        }
+        let (tree, truncated) = catalog.render(input.schema.as_deref());
+        self.record(
+            Some(name),
+            started,
+            Status::Ok,
+            None,
+            Some(scope),
+            Details {
+                truncated: Some(truncated),
+                ..Details::default()
+            },
+        );
+        CallToolResult::structured(json!({"tree": tree, "truncated": truncated}))
     }
 
     fn failed(
@@ -355,6 +671,7 @@ impl McpServer {
         started: Instant,
         scope: Option<Scope<'_>>,
         error: ToolError,
+        approval: Option<&'static str>,
     ) -> CallToolResult {
         self.record(
             Some(tool),
@@ -362,7 +679,10 @@ impl McpServer {
             Status::Error,
             Some(error.code),
             scope,
-            Counts::default(),
+            Details {
+                approval,
+                ..Details::default()
+            },
         );
         error.into_result()
     }
@@ -374,7 +694,7 @@ impl McpServer {
         status: Status,
         code: Option<&'static str>,
         scope: Option<Scope<'_>>,
-        counts: Counts,
+        details: Details,
     ) {
         audit::call(audit::CallRecord {
             tool,
@@ -383,9 +703,10 @@ impl McpServer {
             code,
             duration: started.elapsed(),
             scope,
-            rows: counts.rows,
-            affected_rows: counts.affected_rows,
-            truncated: counts.truncated,
+            rows: details.rows,
+            affected_rows: details.affected_rows,
+            truncated: details.truncated,
+            approval: details.approval,
         });
     }
 }
@@ -416,7 +737,7 @@ impl ServerHandler for McpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
         let started = Instant::now();
         let Some(tool) = Known::from_name(request.name.as_ref()) else {
@@ -426,7 +747,7 @@ impl ServerHandler for McpServer {
                 Status::Error,
                 Some(UNKNOWN_TOOL),
                 None,
-                Counts::default(),
+                Details::default(),
             );
             return Err(rmcp::ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,
@@ -436,47 +757,53 @@ impl ServerHandler for McpServer {
         };
         if !tool.allowed(self.mode) {
             let error = ToolError::mode_unavailable(self.mode, tool.is_mutation());
-            return Ok(self.failed(tool.name(), started, None, error).into());
+            return Ok(self.failed(tool.name(), started, None, error, None).into());
         }
 
         let arguments = request.arguments.unwrap_or_default();
         let result = match tool {
             Known::ListTables => {
-                self.invoke(tool, arguments, started, |input: &ListTables| {
+                self.invoke(tool, arguments, &context, started, |input: &ListTables| {
                     input.prepare()
                 })
                 .await
             }
             Known::DescribeTable => {
-                self.invoke(tool, arguments, started, |input: &DescribeTable| {
-                    input.prepare()
-                })
+                self.invoke(
+                    tool,
+                    arguments,
+                    &context,
+                    started,
+                    |input: &DescribeTable| input.prepare(),
+                )
                 .await
             }
             Known::SelectRows => {
-                self.invoke(tool, arguments, started, |input: &SelectRows| {
+                self.invoke(tool, arguments, &context, started, |input: &SelectRows| {
                     input.prepare()
                 })
                 .await
             }
             Known::InsertRow => {
-                self.invoke(tool, arguments, started, |input: &InsertRow| {
+                self.invoke(tool, arguments, &context, started, |input: &InsertRow| {
                     input.prepare()
                 })
                 .await
             }
             Known::UpdateRows => {
-                self.invoke(tool, arguments, started, |input: &UpdateRows| {
+                self.invoke(tool, arguments, &context, started, |input: &UpdateRows| {
                     input.prepare()
                 })
                 .await
             }
             Known::DeleteRows => {
-                self.invoke(tool, arguments, started, |input: &DeleteRows| {
+                self.invoke(tool, arguments, &context, started, |input: &DeleteRows| {
                     input.prepare()
                 })
                 .await
             }
+            Known::Query => self.query(arguments, &context, started).await,
+            Known::ExploreSchema => self.explore_schema(arguments, started).await,
         };
         Ok(result.into())
     }
@@ -517,36 +844,75 @@ async fn run_stdio(settings: Settings) -> Result<(), String> {
 }
 
 fn build_tools() -> Result<Vec<Tool>, &'static str> {
+    let read = || {
+        ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false)
+    };
+    let insert = || {
+        ToolAnnotations::new()
+            .read_only(false)
+            .destructive(false)
+            .idempotent(false)
+            .open_world(false)
+    };
+    let destructive = || {
+        ToolAnnotations::new()
+            .read_only(false)
+            .destructive(true)
+            .idempotent(false)
+            .open_world(false)
+    };
     Ok(vec![
         Tool::new(
             Known::ListTables.name(),
             "List tables and views visible to the configured SQL Server login.",
             schema_for_input::<ListTables>().map_err(|_| "tool schema generation failed")?,
-        ),
+        )
+        .with_annotations(read()),
         Tool::new(
             Known::DescribeTable.name(),
             "Describe the columns of a table or view.",
             schema_for_input::<DescribeTable>().map_err(|_| "tool schema generation failed")?,
-        ),
+        )
+        .with_annotations(read()),
         Tool::new(
             Known::SelectRows.name(),
             "Read rows from a table or view with equality filters, ordering, and a bounded limit.",
             schema_for_input::<SelectRows>().map_err(|_| "tool schema generation failed")?,
-        ),
+        )
+        .with_annotations(read()),
         Tool::new(
             Known::InsertRow.name(),
             "Insert one row and report the number of affected rows.",
             schema_for_input::<InsertRow>().map_err(|_| "tool schema generation failed")?,
-        ),
+        )
+        .with_annotations(insert()),
         Tool::new(
             Known::UpdateRows.name(),
             "Update at most 100 rows matching equality filters.",
             schema_for_input::<UpdateRows>().map_err(|_| "tool schema generation failed")?,
-        ),
+        )
+        .with_annotations(destructive()),
         Tool::new(
             Known::DeleteRows.name(),
             "Delete at most 100 rows matching equality filters.",
             schema_for_input::<DeleteRows>().map_err(|_| "tool schema generation failed")?,
-        ),
+        )
+        .with_annotations(destructive()),
+        Tool::new(
+            Known::Query.name(),
+            "Run one arbitrary T-SQL batch under the configured login after approval; at most one result set is returned, bounded to 100 rows.",
+            schema_for_input::<Query>().map_err(|_| "tool schema generation failed")?,
+        )
+        .with_annotations(destructive()),
+        Tool::new(
+            Known::ExploreSchema.name(),
+            "Show a bounded indented tree of schemas, tables, columns, relations, views, procedures and functions.",
+            schema_for_input::<ExploreSchema>().map_err(|_| "tool schema generation failed")?,
+        )
+        .with_annotations(read()),
     ])
 }

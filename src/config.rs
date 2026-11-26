@@ -93,6 +93,10 @@ pub struct Cli {
     #[arg(long, env = "MSSQL_TIMEOUT_SECONDS", default_value_t = 15, value_parser = clap::value_parser!(u16).range(1..=300))]
     timeout_seconds: u16,
 
+    /// Skip the approval prompt for mutation tools (dangerous).
+    #[arg(long, env = "MSSQL_MCP_YOLO")]
+    yolo: bool,
+
     /// Skip TLS certificate validation (development only).
     #[arg(long, env = "MSSQL_TRUST_SERVER_CERTIFICATE")]
     trust_server_certificate: bool,
@@ -113,6 +117,8 @@ pub struct Settings {
     /// Bearer token guarding the HTTP transport; always `None` for stdio.
     pub token: Option<String>,
     pub timeout_seconds: u16,
+    /// Whether mutation tools skip the human approval prompt.
+    pub yolo: bool,
     pub trust_server_certificate: bool,
     pub check_config: bool,
 }
@@ -166,6 +172,7 @@ impl Cli {
                 Transport::Http => Some(http_token()?),
             },
             timeout_seconds: self.timeout_seconds,
+            yolo: self.yolo,
             trust_server_certificate: self.trust_server_certificate,
             check_config: self.check_config,
         })

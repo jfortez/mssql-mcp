@@ -11,8 +11,19 @@ mod support;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
-const READ_TOOLS: &[&str] = &["list_tables", "describe_table", "select_rows"];
-const WRITE_TOOLS: &[&str] = &["insert_row", "update_rows", "delete_rows"];
+const READ_TOOLS: &[&str] = &[
+    "list_tables",
+    "describe_table",
+    "select_rows",
+    "explore_schema",
+];
+const WRITE_TOOLS: &[&str] = &[
+    "insert_row",
+    "update_rows",
+    "delete_rows",
+    "query",
+    "explore_schema",
+];
 const ALL_TOOLS: &[&str] = &[
     "list_tables",
     "describe_table",
@@ -20,6 +31,8 @@ const ALL_TOOLS: &[&str] = &[
     "insert_row",
     "update_rows",
     "delete_rows",
+    "query",
+    "explore_schema",
 ];
 
 fn closed_port() -> u16 {
@@ -218,6 +231,32 @@ impl Drop for McpServer {
     }
 }
 
+/// Resolve an enum through a direct value, `$ref` into `$defs`, or the first
+/// `anyOf`/`oneOf` branch that carries it.
+fn enum_values<'a>(schema: &'a Value, property: &'a Value) -> Option<&'a Vec<Value>> {
+    if let Some(values) = property.get("enum").and_then(Value::as_array) {
+        return Some(values);
+    }
+    if let Some(reference) = property.get("$ref").and_then(Value::as_str) {
+        let name = reference.rsplit('/').next()?;
+        return schema
+            .get("$defs")
+            .and_then(|defs| defs.get(name))
+            .and_then(|definition| definition.get("enum"))
+            .and_then(Value::as_array);
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(branches) = property.get(key).and_then(Value::as_array) {
+            for branch in branches {
+                if let Some(values) = enum_values(schema, branch) {
+                    return Some(values);
+                }
+            }
+        }
+    }
+    enum_values(schema, property.get("items")?)
+}
+
 fn tool_error_text(result: &Value) -> &str {
     assert_eq!(
         result["isError"], true,
@@ -285,6 +324,67 @@ fn tools_expose_object_input_schemas() {
         .expect("required list");
     assert!(required.contains(&json!("table")));
     assert!(required.contains(&json!("columns")));
+
+    let query = tools
+        .iter()
+        .find(|tool| tool["name"] == "query")
+        .expect("query present");
+    let required = query["inputSchema"]["required"]
+        .as_array()
+        .expect("query required list");
+    assert!(required.contains(&json!("sql")));
+    assert_eq!(query["inputSchema"]["properties"]["sql"]["type"], "string");
+    let limit_type = &query["inputSchema"]["properties"]["limit"]["type"];
+    assert!(
+        limit_type == "integer"
+            || limit_type
+                .as_array()
+                .is_some_and(|types| types.contains(&json!("integer"))),
+        "limit must be an integer: {limit_type}"
+    );
+
+    let explore = tools
+        .iter()
+        .find(|tool| tool["name"] == "explore_schema")
+        .expect("explore_schema present");
+    let properties = &explore["inputSchema"]["properties"];
+    assert!(properties["schema"].is_object(), "schema filter property");
+    assert_eq!(properties["definition"]["type"], "boolean");
+    let include = enum_values(&explore["inputSchema"], &properties["include"])
+        .unwrap_or_else(|| panic!("include enum in {explore}"));
+    for name in ["tables", "views", "procedures", "functions"] {
+        assert!(
+            include.contains(&json!(name)),
+            "include must accept {name:?}: {include:?}"
+        );
+    }
+
+    // Annotations describe the same eight tools: reads are read-only and
+    // idempotent, insert is additive, update/delete are destructive, and query
+    // may change anything the configured login can reach.
+    let expected = [
+        ("list_tables", true, false, true),
+        ("describe_table", true, false, true),
+        ("select_rows", true, false, true),
+        ("insert_row", false, false, false),
+        ("update_rows", false, true, false),
+        ("delete_rows", false, true, false),
+        ("query", false, true, false),
+        ("explore_schema", true, false, true),
+    ];
+    for (name, read_only, destructive, idempotent) in expected {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} present"));
+        let annotations = tool
+            .get("annotations")
+            .unwrap_or_else(|| panic!("{name} must publish annotations: {tool}"));
+        assert_eq!(annotations["readOnlyHint"], read_only, "{name}");
+        assert_eq!(annotations["destructiveHint"], destructive, "{name}");
+        assert_eq!(annotations["idempotentHint"], idempotent, "{name}");
+        assert_eq!(annotations["openWorldHint"], false, "{name}");
+    }
     server.close();
 }
 

@@ -13,7 +13,7 @@ use tokio::sync::Semaphore;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::config::{Auth, Settings};
-use crate::statement::Statement;
+use crate::statement::{Execution, Statement};
 
 const MAX_IN_FLIGHT: usize = 4;
 const MAX_ROWS: usize = 100;
@@ -32,6 +32,8 @@ pub struct ReadOutput {
 pub enum Outcome {
     Read(ReadOutput),
     Mutation(i64),
+    /// One raw batch with no result set, so no rows or affected count is known.
+    Executed,
 }
 
 /// Sanitized failure classes; the original driver error is never exposed.
@@ -95,20 +97,26 @@ impl Database {
     }
 
     async fn run(&self, statement: Statement) -> Result<Outcome, DbError> {
-        let mutation = statement.mutation;
         let mut client = self.connect().await?;
-        let mut query = Query::new(statement.sql);
-        for parameter in statement.parameters {
-            query.bind(json_to_sql(parameter)?);
-        }
-        let mut stream = query
-            .query(&mut client)
-            .await
-            .map_err(|_| DbError::Failed)?;
-        if mutation {
-            read_mutation(&mut stream).await
+        let mut stream = if statement.execution == Execution::Batch {
+            client
+                .simple_query(statement.sql)
+                .await
+                .map_err(|_| DbError::Failed)?
         } else {
-            read_rows(&mut stream).await
+            let mut query = Query::new(statement.sql);
+            for parameter in statement.parameters {
+                query.bind(json_to_sql(parameter)?);
+            }
+            query
+                .query(&mut client)
+                .await
+                .map_err(|_| DbError::Failed)?
+        };
+        match statement.execution {
+            Execution::Rows => read_rows(&mut stream, statement.limit).await,
+            Execution::Status => read_mutation(&mut stream).await,
+            Execution::Batch => read_batch(&mut stream, statement.limit).await,
         }
     }
 
@@ -183,60 +191,142 @@ fn json_to_sql(value: Value) -> Result<ColumnData<'static>, DbError> {
     }
 }
 
-async fn read_rows(stream: &mut QueryStream<'_>) -> Result<Outcome, DbError> {
-    let mut columns: Option<Vec<String>> = None;
-    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-    let mut truncated = false;
+async fn read_rows(stream: &mut QueryStream<'_>, limit: usize) -> Result<Outcome, DbError> {
+    let mut rows = BoundedRows::new(limit);
 
     while let Some(item) = stream.try_next().await.map_err(|_| DbError::Failed)? {
         match item {
             QueryItem::Metadata(metadata) => {
-                if columns.is_some() {
-                    return Err(DbError::UnexpectedResult);
-                }
-                let names = metadata
-                    .columns()
-                    .iter()
-                    .map(|column| column.name().to_owned())
-                    .collect::<Vec<_>>();
-                if names.is_empty() || names.len() > MAX_COLUMNS {
-                    return Err(DbError::UnexpectedResult);
-                }
-                columns = Some(names);
+                rows.metadata(column_names(metadata.columns()))?;
             }
             QueryItem::Row(row) => {
-                let Some(names) = columns.as_ref() else {
-                    return Err(DbError::UnexpectedResult);
-                };
-                if row.len() != names.len() {
+                let width = rows.width().ok_or(DbError::UnexpectedResult)?;
+                if row.len() != width {
                     return Err(DbError::UnexpectedResult);
                 }
-                if rows.len() == MAX_ROWS {
-                    truncated = true;
+                if rows.push(read_cells(&row, width)?)? {
                     break;
                 }
-                let mut values = Vec::with_capacity(names.len());
-                for (index, _) in names.iter().enumerate() {
-                    let data = row
-                        .get_column_data(index)
-                        .map_err(|_| DbError::UnexpectedResult)?;
-                    let (text, cell_truncated) = cell_text(data)?;
-                    truncated |= cell_truncated;
-                    values.push(text);
-                }
-                rows.push(values);
             }
         }
     }
 
-    let Some(columns) = columns else {
-        return Err(DbError::UnexpectedResult);
-    };
-    Ok(Outcome::Read(ReadOutput {
-        columns,
-        rows,
-        truncated,
-    }))
+    rows.finish().map(Outcome::Read)
+}
+
+/// One arbitrary batch: no result set reports successful execution, exactly one
+/// bounded result set returns rows, and more than one is ambiguous and rejected.
+async fn read_batch(stream: &mut QueryStream<'_>, limit: usize) -> Result<Outcome, DbError> {
+    let mut rows = BoundedRows::new(limit);
+    let mut result_sets = 0usize;
+    let mut full = false;
+
+    while let Some(item) = stream.try_next().await.map_err(|_| DbError::Failed)? {
+        match item {
+            QueryItem::Metadata(metadata) => {
+                result_sets += 1;
+                rows.metadata(column_names(metadata.columns()))?;
+            }
+            QueryItem::Row(row) => {
+                if result_sets == 0 {
+                    return Err(DbError::UnexpectedResult);
+                }
+                if full {
+                    continue;
+                }
+                let width = rows.width().ok_or(DbError::UnexpectedResult)?;
+                if row.len() != width {
+                    return Err(DbError::UnexpectedResult);
+                }
+                full = rows.push(read_cells(&row, width)?)?;
+            }
+        }
+    }
+
+    if result_sets == 0 {
+        return Ok(Outcome::Executed);
+    }
+    rows.finish().map(Outcome::Read)
+}
+
+/// Bounded result state shared by `select_rows` and the raw `query` tool.
+struct BoundedRows {
+    columns: Option<Vec<String>>,
+    rows: Vec<Vec<Option<String>>>,
+    truncated: bool,
+    limit: usize,
+}
+
+impl BoundedRows {
+    fn new(limit: usize) -> Self {
+        Self {
+            columns: None,
+            rows: Vec::new(),
+            truncated: false,
+            limit: limit.clamp(1, MAX_ROWS),
+        }
+    }
+
+    fn metadata(&mut self, names: Vec<String>) -> Result<(), DbError> {
+        if self.columns.is_some() || names.is_empty() || names.len() > MAX_COLUMNS {
+            return Err(DbError::UnexpectedResult);
+        }
+        self.columns = Some(names);
+        Ok(())
+    }
+
+    fn width(&self) -> Option<usize> {
+        self.columns.as_ref().map(Vec::len)
+    }
+
+    /// Store one row, or report that the row cap was reached and reading should
+    /// stop storing. The caller keeps draining the stream so an extra result
+    /// set is still detected.
+    fn push(&mut self, cells: Vec<(Option<String>, bool)>) -> Result<bool, DbError> {
+        let width = self.width().ok_or(DbError::UnexpectedResult)?;
+        if cells.len() != width {
+            return Err(DbError::UnexpectedResult);
+        }
+        if self.rows.len() == self.limit {
+            self.truncated = true;
+            return Ok(true);
+        }
+        for (_, cell_truncated) in &cells {
+            self.truncated |= *cell_truncated;
+        }
+        self.rows
+            .push(cells.into_iter().map(|(text, _)| text).collect());
+        Ok(false)
+    }
+
+    fn finish(self) -> Result<ReadOutput, DbError> {
+        let Some(columns) = self.columns else {
+            return Err(DbError::UnexpectedResult);
+        };
+        Ok(ReadOutput {
+            columns,
+            rows: self.rows,
+            truncated: self.truncated,
+        })
+    }
+}
+
+fn column_names(columns: &[Column]) -> Vec<String> {
+    columns
+        .iter()
+        .map(|column| column.name().to_owned())
+        .collect()
+}
+
+fn read_cells(row: &Row, width: usize) -> Result<Vec<(Option<String>, bool)>, DbError> {
+    let mut cells = Vec::with_capacity(width);
+    for index in 0..width {
+        let data = row
+            .get_column_data(index)
+            .map_err(|_| DbError::UnexpectedResult)?;
+        cells.push(cell_text(data));
+    }
+    Ok(cells)
 }
 
 async fn read_mutation(stream: &mut QueryStream<'_>) -> Result<Outcome, DbError> {
@@ -301,17 +391,163 @@ fn is_status_columns(columns: &[Column]) -> bool {
     columns.len() == 1 && columns[0].name() == MUTATION_COLUMN
 }
 
-fn cell_text(data: &ColumnData<'_>) -> Result<(Option<String>, bool), DbError> {
-    let ColumnData::String(value) = data else {
-        return Err(DbError::UnexpectedResult);
-    };
-    match value {
-        None => Ok((None, false)),
-        Some(text) if text.encode_utf16().count() > MAX_CELL_UNITS => {
-            Ok((Some(truncate_cell(text)), true))
+/// Render one driver value as bounded text. `select_rows` sends strings, while
+/// the raw `query` tool receives whatever types the batch returns, so every
+/// driver variant is rendered rather than rejected.
+fn cell_text(data: &ColumnData<'_>) -> (Option<String>, bool) {
+    match data {
+        ColumnData::U8(value) => scalar(*value),
+        ColumnData::I16(value) => scalar(*value),
+        ColumnData::I32(value) => scalar(*value),
+        ColumnData::I64(value) => scalar(*value),
+        ColumnData::F32(value) => scalar(*value),
+        ColumnData::F64(value) => scalar(*value),
+        ColumnData::Bit(value) => bounded(
+            value.map(|value| if value { "1" } else { "0" }.to_owned()),
+            false,
+        ),
+        ColumnData::String(value) => bounded(value.as_ref().map(|text| text.to_string()), false),
+        ColumnData::Guid(value) => scalar(*value),
+        ColumnData::Binary(value) => match value {
+            None => (None, false),
+            Some(bytes) => binary_text(bytes),
+        },
+        ColumnData::Numeric(value) => scalar(*value),
+        ColumnData::Xml(value) => bounded(value.as_ref().map(|xml| xml.to_string()), false),
+        ColumnData::DateTime(value) => bounded(
+            value.map(|value| datetime_text(i64::from(value.days()), value.seconds_fragments())),
+            false,
+        ),
+        ColumnData::SmallDateTime(value) => bounded(
+            value.map(|value| {
+                datetime_text(
+                    i64::from(value.days()),
+                    u32::from(value.seconds_fragments()),
+                )
+            }),
+            false,
+        ),
+        ColumnData::Time(value) => bounded(
+            value.map(|value| time_text(value.increments(), value.scale())),
+            false,
+        ),
+        ColumnData::Date(value) => {
+            bounded(value.map(|value| date_text(i64::from(value.days()))), false)
         }
-        Some(text) => Ok((Some(text.to_string()), false)),
+        ColumnData::DateTime2(value) => bounded(
+            value.map(|value| {
+                datetime2_text(
+                    value.date().days(),
+                    value.time().increments(),
+                    value.time().scale(),
+                )
+            }),
+            false,
+        ),
+        ColumnData::DateTimeOffset(value) => bounded(
+            value.map(|value| {
+                let offset = i32::from(value.offset());
+                let sign = if offset < 0 { '-' } else { '+' };
+                let minutes = offset.unsigned_abs();
+                format!(
+                    "{}{sign}{:02}:{:02}",
+                    datetime2_text(
+                        value.datetime2().date().days(),
+                        value.datetime2().time().increments(),
+                        value.datetime2().time().scale(),
+                    ),
+                    minutes / 60,
+                    minutes % 60,
+                )
+            }),
+            false,
+        ),
     }
+}
+
+fn scalar<T: ToString>(value: Option<T>) -> (Option<String>, bool) {
+    bounded(value.map(|value| value.to_string()), false)
+}
+
+fn bounded(value: Option<String>, truncated: bool) -> (Option<String>, bool) {
+    match value {
+        None => (None, false),
+        Some(text) if text.encode_utf16().count() > MAX_CELL_UNITS => {
+            (Some(truncate_cell(&text)), true)
+        }
+        Some(text) => (Some(text), truncated),
+    }
+}
+
+fn binary_text(bytes: &[u8]) -> (Option<String>, bool) {
+    let mut text = String::with_capacity(MAX_CELL_UNITS + 2);
+    text.push_str("0x");
+    let mut truncated = false;
+    for byte in bytes {
+        if text.len() + 2 > MAX_CELL_UNITS {
+            truncated = true;
+            break;
+        }
+        text.push_str(&format!("{byte:02X}"));
+    }
+    bounded(Some(text), truncated)
+}
+
+fn date_text(days: i64) -> String {
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn datetime_text(days_since_1900: i64, fragments: u32) -> String {
+    let date = date_text(days_since_1900 + 693_595);
+    let seconds = fragments / 300;
+    let millis = (fragments % 300) * 1000 / 300;
+    format!(
+        "{date} {:02}:{:02}:{:02}.{millis:03}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60,
+    )
+}
+
+fn datetime2_text(days: u32, increments: u64, scale: u8) -> String {
+    format!(
+        "{} {}",
+        date_text(i64::from(days)),
+        time_text(increments, scale)
+    )
+}
+
+fn time_text(increments: u64, scale: u8) -> String {
+    let scale = scale.min(9);
+    let divisor = 10u64.pow(u32::from(scale));
+    let total_seconds = increments / divisor;
+    let fraction = increments % divisor;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    if scale == 0 {
+        return format!("{hours:02}:{minutes:02}:{seconds:02}");
+    }
+    let digits = usize::from(scale);
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{fraction:0digits$}")
+}
+
+/// Days since 1 January year 1 to a civil date.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 306; // days since 1 March year 0
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month, day)
 }
 
 fn truncate_cell(text: &str) -> String {
@@ -323,4 +559,117 @@ fn truncate_cell(text: &str) -> String {
         units.pop();
     }
     String::from_utf16_lossy(&units)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(text: &str) -> (Option<String>, bool) {
+        cell_text(&ColumnData::String(Some(Cow::Owned(text.to_owned()))))
+    }
+
+    fn one_column() -> BoundedRows {
+        let mut rows = BoundedRows::new(MAX_ROWS);
+        rows.metadata(vec!["id".to_owned()]).expect("one column");
+        rows
+    }
+
+    #[test]
+    fn seventeen_columns_are_rejected() {
+        let mut rows = BoundedRows::new(MAX_ROWS);
+        let names = (0..=MAX_COLUMNS).map(|index| format!("c{index}")).collect();
+        assert_eq!(rows.metadata(names), Err(DbError::UnexpectedResult));
+    }
+
+    #[test]
+    fn sixteen_columns_are_accepted() {
+        let mut rows = BoundedRows::new(MAX_ROWS);
+        let names = (0..MAX_COLUMNS).map(|index| format!("c{index}")).collect();
+        rows.metadata(names).expect("sixteen columns");
+        assert_eq!(rows.width(), Some(MAX_COLUMNS));
+    }
+
+    #[test]
+    fn a_second_result_set_is_ambiguous() {
+        let mut rows = one_column();
+        assert_eq!(
+            rows.metadata(vec!["id".to_owned()]),
+            Err(DbError::UnexpectedResult)
+        );
+    }
+
+    #[test]
+    fn the_row_cap_sets_truncated() {
+        let mut rows = one_column();
+        for _ in 0..MAX_ROWS {
+            assert_eq!(rows.push(vec![cell("1")]), Ok(false));
+        }
+        assert_eq!(rows.push(vec![cell("1")]), Ok(true));
+        let read = rows.finish().expect("bounded read");
+        assert_eq!(read.rows.len(), MAX_ROWS);
+        assert!(read.truncated);
+    }
+
+    #[test]
+    fn a_requested_limit_lowers_the_row_cap() {
+        let mut rows = BoundedRows::new(2);
+        rows.metadata(vec!["id".to_owned()]).expect("one column");
+        assert_eq!(rows.push(vec![cell("1")]), Ok(false));
+        assert_eq!(rows.push(vec![cell("2")]), Ok(false));
+        assert_eq!(rows.push(vec![cell("3")]), Ok(true));
+        let read = rows.finish().expect("bounded read");
+        assert_eq!(read.rows.len(), 2);
+        assert!(read.truncated);
+    }
+
+    #[test]
+    fn oversized_cells_are_truncated_at_the_cell_bound() {
+        let (text, truncated) = cell(&"x".repeat(MAX_CELL_UNITS + 10));
+        assert!(truncated);
+        let text = text.expect("string cell");
+        assert_eq!(text.encode_utf16().count(), MAX_CELL_UNITS);
+
+        let mut rows = one_column();
+        assert_eq!(rows.push(vec![(Some(text), truncated)]), Ok(false));
+        assert!(rows.finish().expect("bounded read").truncated);
+    }
+
+    #[test]
+    fn rows_before_metadata_are_rejected() {
+        let mut rows = BoundedRows::new(MAX_ROWS);
+        assert_eq!(rows.push(vec![cell("1")]), Err(DbError::UnexpectedResult));
+    }
+
+    #[test]
+    fn driver_types_render_as_text() {
+        assert_eq!(
+            cell_text(&ColumnData::I32(Some(-7))),
+            (Some("-7".to_owned()), false)
+        );
+        assert_eq!(
+            cell_text(&ColumnData::Bit(Some(true))),
+            (Some("1".to_owned()), false)
+        );
+        assert_eq!(
+            cell_text(&ColumnData::Binary(Some(Cow::Borrowed(&[0x00, 0xAB])))),
+            (Some("0x00AB".to_owned()), false)
+        );
+        assert_eq!(
+            cell_text(&ColumnData::Date(Some(tiberius::time::Date::new(0)))),
+            (Some("0001-01-01".to_owned()), false)
+        );
+        assert_eq!(
+            cell_text(&ColumnData::Time(Some(tiberius::time::Time::new(0, 3)))),
+            (Some("00:00:00.000".to_owned()), false)
+        );
+        assert_eq!(
+            cell_text(&ColumnData::Time(Some(tiberius::time::Time::new(1_234, 3)))),
+            (Some("00:00:01.234".to_owned()), false)
+        );
+        assert_eq!(date_text(719_162), "1970-01-01");
+        assert_eq!(date_text(639_905), "1753-01-01");
+        assert_eq!(datetime_text(0, 0), "1900-01-01 00:00:00.000");
+        assert_eq!(datetime_text(0, 12_960_000), "1900-01-01 12:00:00.000");
+    }
 }

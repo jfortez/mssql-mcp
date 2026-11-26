@@ -54,7 +54,7 @@ struct Server {
 }
 
 impl Server {
-    fn spawn(mode: &str, port: u16, auth: &str, trust: bool) -> Self {
+    fn spawn(mode: &str, port: u16, auth: &str, trust: bool, yolo: bool) -> Self {
         let port = port.to_string();
         let mut command = Command::new(env!("CARGO_BIN_EXE_mssql-mcp"));
         support::clear_env(&mut command)
@@ -80,6 +80,9 @@ impl Server {
             .stderr(Stdio::piped());
         if trust {
             command.arg("--trust-server-certificate");
+        }
+        if yolo {
+            command.arg("--yolo");
         }
         let mut child = command.spawn().expect("spawn MCP server");
         let stdin = child.stdin.take().expect("server stdin");
@@ -147,7 +150,13 @@ impl Server {
     }
 
     fn start(mode: &str, port: u16) -> Self {
-        let mut server = Self::spawn(mode, port, "sql", false);
+        Self::start_with(mode, port, true)
+    }
+
+    /// `yolo` false keeps the approval gate active, which is what a refused
+    /// mutation needs in order to be audited.
+    fn start_with(mode: &str, port: u16, yolo: bool) -> Self {
+        let mut server = Self::spawn(mode, port, "sql", false, yolo);
         let startup = server.next_audit();
         assert_eq!(startup.json["event"], "startup", "{}", startup.raw);
         server.initialize();
@@ -285,7 +294,7 @@ fn error_of(result: &Value) -> &Value {
 #[test]
 fn startup_and_shutdown_records_describe_static_config() {
     let port = closed_port();
-    let mut server = Server::spawn("read", port, "sql", false);
+    let mut server = Server::spawn("read", port, "sql", false, true);
     let startup = server.next_audit();
     assert_eq!(startup.json["mode"], "read", "{}", startup.raw);
     assert_eq!(startup.json["auth"], "sql", "{}", startup.raw);
@@ -307,7 +316,7 @@ fn startup_and_shutdown_records_describe_static_config() {
     assert_eq!(remaining[0].json["event"], "shutdown");
     assert_eq!(remaining[0].json["status"], "ok");
 
-    let mut server = Server::spawn("both", port, "ntlm", true);
+    let mut server = Server::spawn("both", port, "ntlm", true, true);
     let startup = server.next_audit();
     assert_eq!(startup.json["mode"], "both", "{}", startup.raw);
     assert_eq!(startup.json["auth"], "ntlm", "{}", startup.raw);
@@ -336,11 +345,63 @@ fn write_connection_failure_is_audited_as_not_attempted() {
     assert_eq!(response["content"][0]["text"], "database operation failed");
     let record = server.next_audit();
     assert_eq!(record.json["code"], "connection_failed", "{}", record.raw);
+    assert_eq!(record.json["approval"], "yolo", "{}", record.raw);
     assert_eq!(
         record.json["scope"],
         json!({"schema": "dbo", "table": "Items"})
     );
     assert!(!record.raw.contains("SELECT") && !record.raw.contains("@P1"));
+    let remaining = server.shutdown();
+    assert_eq!(remaining.len(), 1, "{remaining:?}");
+    assert_eq!(remaining[0].json["event"], "shutdown");
+}
+
+#[test]
+fn refused_mutation_is_audited_as_unavailable_and_reads_have_no_approval() {
+    let mut server = Server::start_with("both", closed_port(), false);
+    let response = server.call_tool(
+        "delete_rows",
+        json!({"table": {"name": "Items"}, "filters": {"id": 1}}),
+    );
+    let error = error_of(&response);
+    assert_eq!(error["code"], "approval_unavailable");
+    assert_eq!(error["mutation_outcome"], "not_attempted");
+    assert_eq!(error["retryable"], false);
+    let record = server.next_audit();
+    assert_eq!(record.json["event"], "tool_call", "{}", record.raw);
+    assert_eq!(record.json["tool"], "delete_rows", "{}", record.raw);
+    assert_eq!(record.json["approval"], "unavailable", "{}", record.raw);
+    assert_eq!(
+        record.json["code"], "approval_unavailable",
+        "{}",
+        record.raw
+    );
+    assert_eq!(
+        record.json["scope"],
+        json!({"schema": "dbo", "table": "Items"}),
+        "{}",
+        record.raw
+    );
+    for absent in ["rows", "affected_rows", "truncated"] {
+        assert!(
+            record.json.get(absent).is_none(),
+            "unexpected {absent} in {}",
+            record.raw
+        );
+    }
+
+    let response = server.call_tool(
+        "select_rows",
+        json!({"table": {"name": "Items"}, "columns": ["id"]}),
+    );
+    assert_eq!(error_of(&response)["code"], "connection_failed");
+    let record = server.next_audit();
+    assert_eq!(record.json["tool"], "select_rows", "{}", record.raw);
+    assert!(
+        record.json.get("approval").is_none(),
+        "a read record must not carry an approval outcome: {}",
+        record.raw
+    );
     let remaining = server.shutdown();
     assert_eq!(remaining.len(), 1, "{remaining:?}");
     assert_eq!(remaining[0].json["event"], "shutdown");
@@ -378,7 +439,7 @@ fn validated_scope_is_audited_without_queries_or_values() {
         "{}",
         record.raw
     );
-    for absent in ["rows", "affected_rows", "truncated", "jsonrpc"] {
+    for absent in ["rows", "affected_rows", "truncated", "approval", "jsonrpc"] {
         assert!(
             record.json.get(absent).is_none(),
             "unexpected {absent} in {}",
