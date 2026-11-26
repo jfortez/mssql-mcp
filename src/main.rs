@@ -1,11 +1,34 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use mssql_mcp::config::Cli;
+use mssql_mcp::config::{Cli, Command};
+
+mod map_command;
+mod map_html;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let settings = match Cli::parse().settings() {
+    let cli = Cli::parse();
+    if let Some(Command::Map(ref options)) = cli.command {
+        let settings = match options.settings() {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!("Configuration error: {error}");
+                return ExitCode::from(2);
+            }
+        };
+        return match map_command::export(options, settings).await {
+            Ok(()) => {
+                println!("Schema map written to {}", options.out.display());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Schema map error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let settings = match cli.settings() {
         Ok(settings) => settings,
         Err(error) => {
             eprintln!("Configuration error: {error}");

@@ -1,7 +1,8 @@
 use std::env;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Mode {
@@ -56,25 +57,42 @@ impl Auth {
     }
 }
 
-#[derive(Parser)]
-#[command(version, about)]
-pub struct Cli {
+#[derive(Args)]
+struct ConnectionOptions {
     /// SQL Server hostname (or IP address).
-    #[arg(long, env = "MSSQL_HOST")]
-    host: String,
+    #[arg(long, env = "MSSQL_HOST", required = true)]
+    host: Option<String>,
 
     /// SQL Server TCP port. Use the configured port for a named instance.
     #[arg(long, env = "MSSQL_PORT", default_value_t = 1433, value_parser = clap::value_parser!(u16).range(1..))]
     port: u16,
 
     /// SQL Server database name.
-    #[arg(long, env = "MSSQL_DATABASE")]
-    database: String,
+    #[arg(long, env = "MSSQL_DATABASE", required = true)]
+    database: Option<String>,
 
     /// SQL login, current Windows identity, or explicit NTLM credentials.
     /// SQL/NTLM use MSSQL_USER and MSSQL_PASSWORD; NTLM also uses MSSQL_DOMAIN.
     #[arg(long, env = "MSSQL_AUTH", value_enum, default_value = "sql")]
     auth: AuthKind,
+
+    /// Operation deadline in seconds, including opening a connection.
+    #[arg(long, env = "MSSQL_TIMEOUT_SECONDS", default_value_t = 15, value_parser = clap::value_parser!(u16).range(1..=300))]
+    timeout_seconds: u16,
+
+    /// Skip TLS certificate validation (development only).
+    #[arg(long, env = "MSSQL_TRUST_SERVER_CERTIFICATE")]
+    trust_server_certificate: bool,
+}
+
+#[derive(Parser)]
+#[command(version, about, subcommand_negates_reqs = true)]
+pub struct Cli {
+    #[command(flatten)]
+    connection: ConnectionOptions,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
 
     /// Expose reading tools, mutation tools, or both.
     #[arg(long, env = "MSSQL_MODE", value_enum, default_value = "read")]
@@ -89,21 +107,43 @@ pub struct Cli {
     #[arg(long, env = "MSSQL_MCP_HTTP_LISTEN", default_value = "127.0.0.1:8765")]
     http_listen: SocketAddr,
 
-    /// Operation deadline in seconds, including opening a connection.
-    #[arg(long, env = "MSSQL_TIMEOUT_SECONDS", default_value_t = 15, value_parser = clap::value_parser!(u16).range(1..=300))]
-    timeout_seconds: u16,
-
     /// Skip the approval prompt for mutation tools (dangerous).
     #[arg(long, env = "MSSQL_MCP_YOLO")]
     yolo: bool,
 
-    /// Skip TLS certificate validation (development only).
-    #[arg(long, env = "MSSQL_TRUST_SERVER_CERTIFICATE")]
-    trust_server_certificate: bool,
-
     /// Validate configuration without connecting to SQL Server.
     #[arg(long)]
     check_config: bool,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Export a read-only catalog map once, without starting an MCP transport.
+    Map(MapOptions),
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum MapFormat {
+    Html,
+    Json,
+}
+
+#[derive(Args)]
+pub struct MapOptions {
+    #[command(flatten)]
+    connection: ConnectionOptions,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value = "html")]
+    pub format: MapFormat,
+
+    /// Path to a new output file.
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Restrict the map to this schema.
+    #[arg(long)]
+    pub schema: Option<String>,
 }
 
 pub struct Settings {
@@ -125,10 +165,34 @@ pub struct Settings {
 
 impl Cli {
     pub fn settings(self) -> Result<Settings, &'static str> {
-        if self.host.trim().is_empty() || self.host.chars().any(char::is_whitespace) {
+        let mut settings = self.connection.settings()?;
+        settings.mode = self.mode;
+        settings.transport = self.transport;
+        settings.http_listen = self.http_listen;
+        settings.token = match self.transport {
+            Transport::Stdio => None,
+            Transport::Http => Some(http_token()?),
+        };
+        settings.yolo = self.yolo;
+        settings.check_config = self.check_config;
+        Ok(settings)
+    }
+}
+
+impl MapOptions {
+    pub fn settings(&self) -> Result<Settings, &'static str> {
+        self.connection.settings()
+    }
+}
+
+impl ConnectionOptions {
+    fn settings(&self) -> Result<Settings, &'static str> {
+        let host = self.host.as_deref().ok_or("host is required")?;
+        if host.trim().is_empty() || host.chars().any(char::is_whitespace) {
             return Err("host must be a non-empty hostname or IP address");
         }
-        if self.database.trim().is_empty() {
+        let database = self.database.as_deref().ok_or("database is required")?;
+        if database.trim().is_empty() {
             return Err("database must not be blank");
         }
         let auth = match self.auth {
@@ -160,21 +224,18 @@ impl Cli {
             }
         };
         Ok(Settings {
-            host: self.host,
+            host: host.to_owned(),
             port: self.port,
-            database: self.database,
+            database: database.to_owned(),
             auth,
-            mode: self.mode,
-            transport: self.transport,
-            http_listen: self.http_listen,
-            token: match self.transport {
-                Transport::Stdio => None,
-                Transport::Http => Some(http_token()?),
-            },
+            mode: Mode::Read,
+            transport: Transport::Stdio,
+            http_listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 8765)),
+            token: None,
             timeout_seconds: self.timeout_seconds,
-            yolo: self.yolo,
+            yolo: false,
             trust_server_certificate: self.trust_server_certificate,
-            check_config: self.check_config,
+            check_config: false,
         })
     }
 }

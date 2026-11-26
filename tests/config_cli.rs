@@ -11,6 +11,25 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> Output {
 }
 
 const CONNECTION: &[&str] = &["--host", "localhost", "--database", "test"];
+
+#[test]
+fn map_help_describes_the_one_shot_export_without_connecting() {
+    let out = run(&["map", "--help"], &[]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let help = String::from_utf8(out.stdout).unwrap();
+    for option in [
+        "--format",
+        "html",
+        "json",
+        "--out",
+        "--schema",
+        "--host",
+        "--database",
+    ] {
+        assert!(help.contains(option), "missing {option} in {help}");
+    }
+}
 const TOKEN: &str = "mssql-mcp-http-test-token_0123456789";
 const TOKEN_ERROR: &[u8] =
     b"Configuration error: MSSQL_MCP_TOKEN must be 32 to 128 characters of A-Z, a-z, 0-9, '_' or '-'\n";

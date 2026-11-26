@@ -180,6 +180,17 @@ The Agent Client Protocol does not carry an MCP transport by itself. An ACP host
 
 `explore_schema` is read-only and available in every mode. It returns one indented `tree` string: schemas; under each, tables with column count and primary key, columns with type and nullability, outgoing and incoming foreign-key relations, views, procedures with parameter signatures and definition size, and functions with return type and parameter signatures. `schema` narrows the tree, `include` selects `tables`, `views`, `procedures` and `functions` (all four by default), and `definition: true` inlines procedure and function bodies from `sys.sql_modules`. Foreign-key edges identify the constraint and pair the child and referenced columns in constraint order. Catalog queries and the tree itself are bounded: per-table column cuts and per-routine definition cuts say how much was omitted. Any cut sets `truncated` and ends the tree with a visible `… truncated` line.
 
+## Export a schema map without MCP
+
+```sh
+mssql-mcp map --format html --out /tmp/sales-schema.html --schema Sales
+mssql-mcp map --format json --out /tmp/sales-schema.json --schema Sales
+```
+
+Use the same SQL connection flags or `MSSQL_*` connection settings as the server. The command connects directly to SQL Server, reads every catalog page, writes one new file, and exits. It does not start an MCP transport, need a bearer token, or modify the database. Omit `--schema` to export all visible schemas. `mssql-mcp map --help` lists the flags.
+
+Open the HTML file offline to see tables grouped by schema, with arrows from child tables to the tables they reference. Dashed boxes identify tables outside the selected schema. JSON contains the catalog entries and identifies any clipped expressions. The command refuses to overwrite an existing path.
+
 ## Audit and errors
 
 JSON Lines on stderr, stdout reserved for MCP. One `tool_call` record per handled call, plus `startup` and `shutdown`:
