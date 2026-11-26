@@ -33,7 +33,7 @@ Every setting is a command-line flag and an environment variable. Use the enviro
 
 Authentication modes: `sql` uses `MSSQL_USER`/`MSSQL_PASSWORD`; `ntlm` uses those plus `MSSQL_DOMAIN`; `windows` uses the current Windows process identity, so it is unavailable on Linux and in the Docker image and does not use the two SQL credentials. No mode falls back to another identity.
 
-TLS is required and certificates are validated against the system store: use the hostname in the server certificate. `MSSQL_MODE=read` exposes `list_tables`, `describe_table`, `select_rows` and `explore_schema`; `write` exposes `insert_row`, `update_rows`, `delete_rows`, `query` and `explore_schema`; `both` exposes all eight. Updates and deletes need at least one filter and roll back when more than 100 rows would change. Every table mutation asks the client to confirm the target, columns and 100-row cap before connecting; `query` asks before every batch and shows the exact SQL. `--yolo` (or `MSSQL_MCP_YOLO=true`) skips those prompts and the audit trail records the bypass. Give the login only the SQL Server permissions it needs.
+TLS is required and certificates are validated against the system store: use the hostname in the server certificate. `MSSQL_MODE=read` exposes the read tools in the table below; `write` exposes `insert_row`, `update_rows`, `delete_rows`, `query` and `explore_schema`; `both` exposes all 13. Updates and deletes need at least one filter and roll back when more than 100 rows would change. Every table mutation asks the client to confirm the target, columns and 100-row cap before connecting; `query` asks before every batch and shows the exact SQL. `--yolo` (or `MSSQL_MCP_YOLO=true`) skips those prompts and the audit trail records the bypass. Give the login only the SQL Server permissions it needs.
 
 Validate without connecting: `mssql-mcp --check-config`. All flags: `mssql-mcp --help`.
 
@@ -166,19 +166,30 @@ The Agent Client Protocol does not carry an MCP transport by itself. An ACP host
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `list_tables` | `schema?`, `offset?` | `schema`, `name`, `type`, `object_id` per table or view, 100 per page |
-| `describe_table` | `table`, `offset?` | `name`, `type`, `max_length`, `precision`, `scale`, `is_nullable`, `ordinal` |
+| `describe_table` | `table`, `offset?` | Column name, declared and base types, maximum length, precision, scale, nullability and ordinal |
 | `select_rows` | `table`, `columns`, `filters?`, `order_by?`, `limit?`, `offset?` | `columns`, `rows`, `truncated` |
 | `insert_row` | `table`, `values` | `affected_rows` |
 | `update_rows` | `table`, `values`, `filters` | `affected_rows` |
 | `delete_rows` | `table`, `filters` | `affected_rows` |
 | `query` | `sql`, `limit?` | `columns`, `rows`, `truncated` for one result set, or `executed` |
 | `explore_schema` | `schema?`, `include?`, `definition?` | `tree`, `truncated` |
+| `schema_map` | `schema?`, `include?`, `table?`, `offset?`, `limit?` | Paged `entries`: schemas, objects, columns, keys, indexes and routine parameters |
+| `object_dependencies` | `object`, `offset?`, `limit?` | Paged `edges` from SQL expressions and foreign keys, incoming and outgoing |
+| `search_objects` | `query`, `schema?`, `include?`, `offset?`, `limit?` | Paged `hits` by literal name fragment; `include` accepts `objects` or `columns` |
+| `table_stats` | `table`, `offset?`, `limit?` | Approximate row count and base storage, plus index sizes paged by `next_index_offset` |
+| `sample_rows` | `table`, `limit?` | Up to 25 rows, default 5, using the first 64 columns in catalog order |
 
-`table` is `{"schema": "dbo", "name": "Products"}`; functions such as `schema` default to `dbo`. Filters are equality checks combined with `AND`, `null` matching `NULL`. Selects return 25 rows by default (maximum 100) and projects every column as text, capped at 1,024 UTF-16 units; a `truncated` flag reports a cut cell or page. Use a unique `order_by` for stable pagination. Mutations return `affected_rows: -1` with `mutation_outcome: rolled_back` when the 100-row limit rolled back.
+`table` and `object` are `{"schema": "dbo", "name": "Products"}`; the schema defaults to `dbo`. `describe_table` reports `object_not_found` for missing or invisible objects and gives character lengths for character types (`-1` means `max`). Filters are equality checks combined with `AND`, with `null` matching SQL `NULL`.
+
+`select_rows` accepts 1–64 column names and returns 25 rows by default (maximum 100). Values are text, including uppercase hex for binary and serialized XML; each cell is capped at 1,024 UTF-16 units. `truncated` means more rows exist or a returned value was clipped. Use a unique `order_by` for stable pagination. `sample_rows` is unordered; a table wider than 64 columns sets `columns_omitted` and `truncated`.
+
+`insert_row` binds numeric JSON values as numbers. SQL Server can implicitly convert them into text columns; pass a JSON string when the exact text matters. A mutation that hits the 100-row rollback guard returns `affected_rows: -1` with `mutation_outcome: rolled_back`.
 
 `query` runs one arbitrary T-SQL batch under the configured principal, exactly as sent. It can read or change any data or server state that principal can reach, including other databases, and it has no affected-row cap. Every batch requires approval unless `--yolo`, and the prompt carries the exact SQL so the human consents to the real bytes. At most one result set is returned, bounded to 100 rows by default (`limit` can lower it), 16 columns and 1,024 UTF-16 units per cell; a `truncated` flag reports a cut. A batch with no result set returns `executed: true`; more than one result set returns `unrecognized_result` without a mutation outcome. If SQL Server rejects a statement in a raw batch, check the database before retrying: earlier statements may have committed. SQL Server permissions remain the real boundary: the approval prompt is a guardrail, not a sandbox.
 
 `explore_schema` is read-only and available in every mode. It returns one indented `tree` string: schemas; under each, tables with column count and primary key, columns with type and nullability, outgoing and incoming foreign-key relations, views, procedures with parameter signatures and definition size, and functions with return type and parameter signatures. `schema` narrows the tree, `include` selects `tables`, `views`, `procedures` and `functions` (all four by default), and `definition: true` inlines procedure and function bodies from `sys.sql_modules`. Foreign-key edges identify the constraint and pair the child and referenced columns in constraint order. Catalog queries and the tree itself are bounded: per-table column cuts and per-routine definition cuts say how much was omitted. Any cut sets `truncated` and ends the tree with a visible `… truncated` line.
+
+`schema_map` returns separate records for each object and its children with stable IDs. Follow `next_offset` until it is `null`; it is independent of `truncated`, which flags clipped default, computed, or index-filter expressions. Foreign keys include both named endpoints and separate ordered column pairs. The `include` filter accepts `tables`, `views`, `procedures`, and `functions`. Table counts are approximate partition metadata, not `COUNT(*)` scans. `object_dependencies` also reports SQL-expression references that SQL Server cannot resolve locally.
 
 ## Export a schema map without MCP
 
@@ -210,6 +221,7 @@ Tool errors keep `isError`, a human-readable `content[0].text` and a `structured
 | `mode_unavailable` | tool disabled by `MSSQL_MODE` | `not_attempted` |
 | `invalid_arguments` | arguments do not match the tool schema | `not_attempted` |
 | `invalid_input` | a validated field was rejected | `not_attempted` |
+| `object_not_found` | a requested catalog object is missing or not visible | omitted |
 | `approval_denied` | the human declined or cancelled, or the approval prompt timed out | `not_attempted` |
 | `approval_unavailable` | the client cannot show an approval prompt, or asking it failed | `not_attempted` |
 | `database_busy` | four operations already active | `not_attempted` |
@@ -231,4 +243,4 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 Start with `explore_schema` before any query: it returns the schemas, tables, columns, keys, relations and routine signatures in one indented tree, so an agent can see where data lives without guessing. Narrow it with `schema`, or add `definition: true` to read procedure and function bodies.
 
-A reliable order for a new database is `explore_schema` → `describe_table` for the tables that matter → `select_rows` with explicit columns and an `order_by`. Reach for `query` only when the structured tools cannot express the read, and for DDL only with the bypass enabled deliberately.
+A reliable order for a new database is `explore_schema` → `describe_table` → `sample_rows` or a sorted `select_rows`. Use `search_objects` if you know part of a name, `object_dependencies` for impact analysis, and `schema_map` when you need to page through the whole catalog. Reach for `query` only when the structured tools cannot express the operation and the human has approved it or deliberately enabled `--yolo`.

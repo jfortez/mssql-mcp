@@ -87,13 +87,36 @@ def fixture(image, *, network=None, reader_password=None):
             GRANT ALTER ON SCHEMA::probe TO mcp_writer;
         """
         wide = ("CREATE TABLE dbo.Wide (" + ", ".join(f"c{i} int NULL" for i in range(120))
-                + "); GRANT VIEW DEFINITION ON dbo.Wide TO mcp_writer;"
+                + "); GRANT SELECT ON dbo.Wide TO mcp_writer;"
                 + " CREATE TABLE probe.Doomed (id int NOT NULL PRIMARY KEY);"
                 + " INSERT probe.Doomed VALUES (1), (2), (3);"
                 + " GRANT SELECT, DELETE ON probe.Doomed TO mcp_writer;")
+        types_and_relations = """
+            CREATE TABLE dbo.Addresses (id int NOT NULL PRIMARY KEY);
+            INSERT dbo.Addresses VALUES (1), (2);
+            CREATE TABLE dbo.TypedReads (
+                id int NOT NULL PRIMARY KEY, fixed dbo.Nickname NULL,
+                bytes varbinary(8) NULL, document xml NULL,
+                ship_to int NOT NULL, bill_to int NOT NULL,
+                CONSTRAINT FK_TypedReads_Ship FOREIGN KEY (ship_to) REFERENCES dbo.Addresses (id),
+                CONSTRAINT FK_TypedReads_Bill FOREIGN KEY (bill_to) REFERENCES dbo.Addresses (id)
+            );
+            INSERT dbo.TypedReads VALUES (1, N'James', 0xFE010A, N'<value/>', 1, 2);
+            GRANT SELECT ON dbo.TypedReads TO mcp_reader, mcp_writer;
+            GRANT VIEW DEFINITION ON TYPE::dbo.Nickname TO mcp_writer;
+            GRANT SELECT ON dbo.Addresses TO mcp_reader, mcp_writer;
+        """
+        long_definition = (
+            "CREATE PROCEDURE dbo.usp_long_definition AS /* " + "x" * 1600
+            + " */ SELECT 42 AS result;"
+        )
         batches = [("create", create, "master"), ("schema", schema, "McpFixture"),
                    ("trigger", trigger, "McpFixture"), ("procedures", procedures, "McpFixture"),
-                   ("wide", wide, "McpFixture")]
+                   ("wide", wide, "McpFixture"),
+                   ("alias type", "CREATE TYPE dbo.Nickname FROM nchar(6) NULL;", "McpFixture"),
+                   ("types and relations", types_and_relations, "McpFixture"),
+                   ("long definition", long_definition, "McpFixture"),
+                   ("definition grant", "GRANT VIEW DEFINITION ON dbo.usp_long_definition TO mcp_writer;", "McpFixture")]
         for label, batch, db in batches:
             seeded = sql(name, sa, batch, db)
             if seeded.returncode:
@@ -154,8 +177,8 @@ class Mcp:
 
 
 @contextlib.contextmanager
-def server(binary, host, port, user, password, mode, *, trust, yolo=False):
-    args = [str(binary), "--host", host, "--port", port, "--database", "McpFixture",
+def server(binary, host, port, user, password, mode, *, trust, yolo=False, database="McpFixture"):
+    args = [str(binary), "--host", host, "--port", port, "--database", database,
             "--auth", "sql", "--mode", mode, "--timeout-seconds", "10"]
     if trust:
         args.append("--trust-server-certificate")
@@ -173,7 +196,8 @@ def server(binary, host, port, user, password, mode, *, trust, yolo=False):
                 "protocolVersion": "2025-06-18", "capabilities": {},
                 "clientInfo": {"name": "sql-server-live-test", "version": "1"},
             })
-            assert "tools" in initialize["result"]["capabilities"], initialize
+            client.initialize = initialize["result"]
+            assert "tools" in client.initialize["capabilities"], initialize
             client.send("notifications/initialized", {}, request=False)
             yield client
         finally:
@@ -209,6 +233,12 @@ def verify(binary, host, port, reader, writer):
     with server(binary, host, port, "mcp_reader", reader, "read", trust=True) as client:
         assert client.tool("list_tables", {})["rows"], "visible tables are empty"
         assert len(client.tool("describe_table", {"table": table})["rows"]) == 3
+        typed = {"name": "TypedReads"}
+        entry = next((entry for entry in client.tool("schema_map", {"table": typed})["entries"]
+                      if entry["kind"] == "column" and entry["name"] == "fixed"), None)
+        assert entry and entry["data_type"] == "nchar(6)", entry
+        hits = client.tool("search_objects", {"query": "fixed", "include": ["columns"]})["hits"]
+        assert any(hit["kind"] == "column" and hit["data_type"] == "nchar(6)" for hit in hits), hits
         result = client.tool("select_rows", query)
         assert result["columns"] == ["id", "label"], result
         assert result["rows"] == [["1000", "x" * 1024]], result
@@ -230,6 +260,8 @@ def verify(binary, host, port, reader, writer):
     print("PASS: SQL Server grants still forbid mutations by a read-only login")
 
     with server(binary, host, port, "mcp_writer", writer, "write", trust=True) as client:
+        instructions = client.initialize.get("instructions", "")
+        assert "elicitation" in instructions and "--yolo" in instructions, instructions
         refused = client.tool(
             "insert_row",
             {"table": table, "values": {"id": 1002, "label": "refused", "group_id": 2}},
@@ -275,7 +307,13 @@ def verify(binary, host, port, reader, writer):
         assert "dbo" in text and "Items" in text and "usp_items_count" in text, text
         assert "id" in text and "group_id" in text, text
         assert "CREATE PROCEDURE dbo.usp_items_count" in text, text
-        assert "Wide (120 columns)" in text, text
+        assert "Wide (120 columns)" in text and "columns omitted" in text, text
+        assert all(any(column in line and "Addresses" in line for line in text.splitlines())
+                   for column in ("ship_to", "bill_to")), text
+        long_tree = client.tool("explore_schema", {"include": ["procedures"], "definition": True})
+        assert "usp_long_definition" in long_tree["tree"], long_tree
+        assert (long_tree["truncated"] and "definition" in long_tree["tree"]
+                and long_tree["tree"].count("…") >= 2), long_tree
         assert payload["truncated"] is True and text.rstrip().endswith("… truncated"), text[-200:]
         print("PASS: explore_schema renders schemas, columns, relations and procedure bodies, and marks a catalog cut")
 
@@ -336,13 +374,173 @@ def verify(binary, host, port, reader, writer):
     print("PASS: query is refused without approval and its text stays out of the audit record")
     print("PASS: write/both, INSERT/UPDATE/DELETE, NULL, sorted paging, audited rollback and value redaction")
 
+    with server(binary, host, port, "mcp_writer", writer, "both", trust=True, yolo=True) as client:
+        verify_read_regressions(client, table)
+        typed = {"name": "TypedReads"}
+        columns = ["id", "bytes", "document"]
+        result = client.tool("select_rows", {"table": typed, "columns": columns, "limit": 1})
+        assert result == {"columns": columns, "rows": [["1", "FE010A", "<value/>"]],
+                          "truncated": False}, result
+        result = client.tool("describe_table", {"table": typed})
+        description = dict(zip(result["columns"], next(row for row in result["rows"] if row[0] == "fixed")))
+        assert (description["type"], description["base_type"], description["max_length"]) == (
+            "Nickname", "nchar", "6"), description
+        wide = client.tool("sample_rows", {"table": {"name": "Wide"}})
+        assert len(wide["columns"]) == 64 and wide["columns_omitted"] and wide["truncated"], wide
+        inserted = client.tool("insert_row", {"table": table, "values": {"id": 1004, "label": 123,
+                                                                         "group_id": 2}})
+        assert inserted == {"affected_rows": 1}, inserted
+        coercion = client.tool("select_rows", {"table": table, "columns": ["label"],
+                                              "filters": {"id": 1004}})
+        assert coercion["rows"] == [["123"]], coercion
+        rejected = client.tool("insert_row", {"table": table, "values": {"id": 1, "group_id": 1}},
+                               error=True)["result"]["structuredContent"]
+        assert rejected["code"] == "query_failed" and rejected["mutation_outcome"] == "rolled_back", rejected
+        assert rejected["sql_error"]["number"] in (2601, 2627), rejected
+        original = client.tool("select_rows", {"table": table, "columns": ["id", "label"],
+                                               "filters": {"id": 1}})
+        assert original["rows"] == [["1", "item 1"]], original
+    print("PASS: typed projection, alias metadata, SQL diagnostics, row truncation and confirmed rollback")
+
+
+def verify_read_regressions(client, table):
+    tools = {tool["name"]: tool for tool in client.send("tools/list", {})["result"]["tools"]}
+    for name in ("select_rows", "query"):
+        limit = tools[name]["inputSchema"]["properties"]["limit"]
+        assert (limit["minimum"], limit["maximum"]) == (1, 100), limit
+    key = "id" if table["name"] == "Items" else "OrderID"
+    for order in ({}, {"order_by": [key]}):
+        rows = client.tool("select_rows", {"table": table, "columns": [key], "limit": 1, **order})
+        assert len(rows["rows"]) == 1 and rows["truncated"] is True, rows
+    absent = client.tool("describe_table", {"table": {**table, "name": "McpRegressionTableAbsent"}},
+                         error=True)["result"]["structuredContent"]
+    assert "not found" in absent["message"].lower(), absent
+    for arguments, field in [({"columns": []}, "columns"), ({"columns": [key], "limit": 0}, "limit"),
+                             ({"columns": [key], "offset": 1}, "offset")]:
+        invalid = client.tool("select_rows", {"table": table, **arguments},
+                              error=True)["result"]["structuredContent"]
+        assert "invalid" in invalid["code"] and field in invalid["message"], invalid
+    invalid = client.tool("select_rows", {"table": table}, error=True)["result"]["structuredContent"]
+    assert "columns" in invalid["message"], invalid
+    rejected = client.tool("query", {"sql": "SELECT McpRegressionColumnAbsent"},
+                           error=True)["result"]["structuredContent"]
+    diag = rejected["sql_error"]
+    assert (rejected["code"], diag["number"], diag["severity"]) == ("query_failed", 207, 16), rejected
+    assert "invalid column" in diag["message"].lower(), diag
+    multiple = client.tool("query", {"sql": "SELECT 1 AS n; SELECT 2 AS n;"},
+                           error=True)["result"]["structuredContent"]
+    assert multiple["code"] == "unrecognized_result" and "mutation_outcome" not in multiple, multiple
+
+
+def verify_wwi(binary):
+    address = command("docker", "port", "wwi", "1433/tcp").stdout.strip()
+    host, port = address.rsplit(":", 1)
+    if host != "127.0.0.1":
+        raise RuntimeError("WideWorldImporters must be exposed only on loopback")
+    user, password = os.environ.get("MSSQL_USER", "sa"), os.environ.get("MSSQL_PASSWORD")
+    if not password:
+        raise RuntimeError("Set MSSQL_PASSWORD for the existing WideWorldImporters fixture")
+    with server(binary, host, port, user, password, "both", trust=True, yolo=True,
+                database="WideWorldImporters") as client:
+        orders = {"schema": "Sales", "name": "Orders"}
+        verify_read_regressions(client, orders)
+        stock = {"schema": "Warehouse", "name": "StockItems"}
+        metadata = client.tool("describe_table", {"table": stock})
+        columns = [row[0] for row in metadata["rows"]]
+        assert len(columns) > 22 and "Photo" in columns, metadata
+        rows = client.tool("select_rows", {"table": stock, "columns": columns,
+                                          "order_by": ["StockItemID"], "limit": 1})
+        assert rows["columns"] == columns and len(rows["rows"][0]) == len(columns), rows.keys()
+        tree = client.tool("explore_schema", {"definition": True})
+        assert "columns omitted" in tree["tree"] and tree["truncated"], tree["tree"][-500:]
+        order = client.tool("select_rows", {"table": orders, "columns": ["OrderID", "CustomerID"],
+                                            "order_by": ["OrderID"], "limit": 1})["rows"][0]
+        filters = {"OrderID": int(order[0])}
+        rejected = client.tool("update_rows", {"table": orders, "filters": filters,
+                                                "values": {"CustomerID": None}},
+                               error=True)["result"]["structuredContent"]
+        assert rejected["mutation_outcome"] == "rolled_back", rejected
+        assert rejected["sql_error"]["number"] == 515, rejected
+        unchanged = client.tool("select_rows", {"table": orders, "columns": ["OrderID", "CustomerID"],
+                                                "filters": filters})
+        assert unchanged["rows"] == [order], unchanged
+        verify_wwi_catalog(client, orders, stock)
+    verify_wwi_export(binary, host, port, user, password)
+    print("PASS: WideWorldImporters live regressions against the rebuilt binary")
+
+
+def verify_wwi_catalog(client, orders, stock):
+    entries, ids, offset = [], set(), 0
+    while True:
+        page = client.tool("schema_map", {"table": orders, "offset": offset, "limit": 7})
+        assert page["offset"] == offset and len(page["entries"]) <= 7, page
+        for entry in page["entries"]:
+            assert entry["id"] not in ids, entry
+            ids.add(entry["id"])
+            entries.append(entry)
+        if page["next_offset"] is None:
+            assert len(ids) == page["total"], page
+            break
+        assert page["next_offset"] == len(ids) and page["next_offset"] > offset, page
+        offset = page["next_offset"]
+    kinds = {entry["kind"] for entry in entries}
+    assert {"schema", "object", "column", "key", "key_column", "foreign_key",
+            "foreign_key_column", "index", "index_column"} <= kinds, kinds
+    assert any(entry["kind"] == "foreign_key_column" and entry["parent_column"] == "CustomerID"
+               and entry["referenced_column"] == "CustomerID" for entry in entries)
+    assert any(entry["kind"] == "column" and entry["name"] == "OrderID"
+               and entry["data_type"] == "int" and entry["nullable"] is False for entry in entries)
+    assert any(entry["kind"] == "object" and entry["name"] == "Orders" and entry["row_count"] > 1
+               for entry in entries)
+
+    dependencies = client.tool("object_dependencies", {"object": orders})
+    directions = {edge["direction"] for edge in dependencies["edges"]}
+    assert {"depends_on", "depended_on_by"} <= directions, dependencies
+    hits = client.tool("search_objects", {"query": "StockItem", "schema": "Warehouse", "limit": 3})
+    assert len(hits["hits"]) == 3 and hits["next_offset"] == 3, hits
+    literal = client.tool("search_objects", {"query": "StockItem%", "schema": "Warehouse"})
+    assert literal["hits"] == [], literal
+    stats = client.tool("table_stats", {"table": orders})
+    assert stats["row_count"] > 1 and stats["row_count_approximate"], stats
+    assert stats["reserved_bytes"] >= stats["used_bytes"] > 0 and stats["indexes"], stats
+    rows = client.tool("sample_rows", {"table": stock, "limit": 2})
+    assert len(rows["rows"]) == 2 and "StockItemID" in rows["columns"], rows
+    assert "Photo" in rows["columns"] and rows["truncated"], rows
+    print("PASS: catalog paging, stable IDs, foreign keys, literal search, stats and sampling")
+
+
+def verify_wwi_export(binary, host, port, user, password):
+    env = {name: value for name, value in os.environ.items() if not name.startswith("MSSQL_")}
+    env.update(MSSQL_USER=user, MSSQL_PASSWORD=password, MSSQL_MCP_TRANSPORT="http")
+    args = [str(binary), "map", "--host", host, "--port", port, "--database", "WideWorldImporters",
+            "--trust-server-certificate", "--schema", "Sales"]
+    with tempfile.TemporaryDirectory(prefix="mssql-mcp-map-") as directory:
+        html = Path(directory) / "schema.html"
+        data = Path(directory) / "schema.json"
+        for kind, path in (("html", html), ("json", data)):
+            result = command(*args, "--format", kind, "--out", str(path), env=env, timeout=90,
+                             check=False)
+            assert result.returncode == 0, (result.returncode, result.stderr)
+        svg = html.read_text()
+        assert "<svg" in svg and 'class="edge"' in svg and "Orders" in svg
+        assert "External table" in svg and "<script" not in svg and "<link" not in svg
+        export = json.loads(data.read_text())
+        assert export["schema"] == "Sales" and len(export["entries"]) > 100, len(export["entries"])
+        refused = command(*args, "--out", str(html), env=env, timeout=90, check=False)
+        assert refused.returncode != 0 and html.read_text() == svg, refused.returncode
+    print("PASS: standalone HTML and JSON exports use the same SQL configuration and never overwrite")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/mssql-mcp")
     parser.add_argument("--image", default="mcr.microsoft.com/mssql/server:2022-latest")
+    parser.add_argument("--wwi", action="store_true", help="Probe the preloaded loopback wwi container")
     args = parser.parse_args()
     if not args.binary.is_file():
         parser.error("MCP binary not found; run cargo build --locked first")
-    with fixture(args.image) as connection:
-        verify(args.binary.resolve(), *connection)
+    if args.wwi:
+        verify_wwi(args.binary.resolve())
+    else:
+        with fixture(args.image) as connection:
+            verify(args.binary.resolve(), *connection)
