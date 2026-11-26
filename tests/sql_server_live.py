@@ -31,14 +31,17 @@ def sql(container, password, batch, database="master"):
 
 
 @contextlib.contextmanager
-def fixture(image):
+def fixture(image, *, network=None, reader_password=None):
     name = f"mssql-mcp-test-{uuid.uuid4().hex[:12]}"
     sa, reader, writer = (secrets.token_hex(22) + "Aa1!" for _ in range(3))
+    if reader_password is not None:
+        reader = reader_password
+    network_args = ("--network", network, "--network-alias", "sql") if network else ()
     started = command(
         "docker", "run", "--detach", "--rm", "--pull=never", "--name", name,
         "--publish", "127.0.0.1::1433", "-e", "ACCEPT_EULA=Y", "-e", "MSSQL_PID=Developer",
-        "-e", "MSSQL_SA_PASSWORD", image, env={**os.environ, "MSSQL_SA_PASSWORD": sa},
-        check=False,
+        "-e", "MSSQL_SA_PASSWORD", *network_args, image,
+        env={**os.environ, "MSSQL_SA_PASSWORD": sa}, check=False,
     )
     if started.returncode:
         raise RuntimeError(f"Could not launch the SQL Server fixture: {started.stderr.strip()}")

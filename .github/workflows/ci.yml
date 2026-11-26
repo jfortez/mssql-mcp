@@ -100,3 +100,6 @@ jobs:
 
       - name: Run live SQL Server checks
         run: python3 -u tests/sql_server_live.py --binary target/release/mssql-mcp --image "$SQL_SERVER_IMAGE"
+
+      - name: Verify two clients share one Docker container
+        run: python3 -B -u tests/docker_shared.py --image "$SQL_SERVER_IMAGE"

@@ -1,0 +1,8 @@
+**
+!Dockerfile
+!Cargo.toml
+!Cargo.lock
+!README.md
+!src/
+!src/**
+**/.env*

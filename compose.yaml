@@ -1,0 +1,28 @@
+name: mssql-mcp
+
+services:
+  mssql-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mssql-mcp:local
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      MSSQL_HOST: "${MSSQL_HOST:?MSSQL_HOST is required}"
+      MSSQL_PORT: "${MSSQL_PORT:-1433}"
+      MSSQL_DATABASE: "${MSSQL_DATABASE:?MSSQL_DATABASE is required}"
+      MSSQL_AUTH: "${MSSQL_AUTH:-sql}"
+      MSSQL_DOMAIN: "${MSSQL_DOMAIN:-}"
+      MSSQL_USER: "${MSSQL_USER:?MSSQL_USER is required}"
+      MSSQL_PASSWORD: "${MSSQL_PASSWORD:?MSSQL_PASSWORD is required}"
+      MSSQL_MODE: "${MSSQL_MODE:-read}"
+      MSSQL_TIMEOUT_SECONDS: "${MSSQL_TIMEOUT_SECONDS:-15}"
+      MSSQL_TRUST_SERVER_CERTIFICATE: "${MSSQL_TRUST_SERVER_CERTIFICATE:-false}"
+      MSSQL_MCP_TOKEN: "${MSSQL_MCP_TOKEN:?MSSQL_MCP_TOKEN is required}"

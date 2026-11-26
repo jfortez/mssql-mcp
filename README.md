@@ -1,168 +1,73 @@
 # mssql-mcp
 
-Native stdio MCP server for Microsoft SQL Server. The Rust binary connects over TDS without ODBC or `sqlcmd`. It starts in read mode and connects to SQL Server only when a tool needs it.
+Native MCP server for Microsoft SQL Server. Read-only by default, with authenticated Streamable HTTP for sharing one process across clients.
 
-## Install
+## 1. Install with Cargo
 
-You need Rust 1.88 or newer on the installation host.
+From this checkout (Rust 1.88+): `cargo install --path . --locked`.
 
-### From crates.io (after publication)
+From crates.io **after publication**: `cargo install mssql-mcp --locked`. For Docker, skip Cargo.
 
-```sh
-cargo install mssql-mcp --version 0.1.0 --locked
-```
+## 2. Start one server
 
-Version 0.1.0 is not published yet. Until then, install from a local checkout.
-
-### From a local checkout
-
-From the repository root:
+Export `MSSQL_PASSWORD` from your secret store or shell. Set the host, database and user, then generate **one** token for the server and all clients:
 
 ```sh
-cargo install --path . --locked
-mssql-mcp --version
+export MSSQL_HOST=sql.example.com MSSQL_DATABASE=Inventory MSSQL_USER=mcp_reader
+export MSSQL_MCP_TOKEN="$(openssl rand -hex 32)"
+mssql-mcp --transport http
 ```
 
-Cargo installs the executable in its `bin` directory (`~/.cargo/bin` by default). If your MCP client cannot find it, use the full path to `mssql-mcp` (`mssql-mcp.exe` on Windows). To build without installing, use `cargo build --release --locked`; the binary is under `target/release/`.
+**Docker instead:** with those same variables set, run `docker compose up -d --build`. It binds only to host loopback and runs as non-root with a read-only filesystem. `MSSQL_HOST` must be reachable from the container. Stop with `docker compose down`. Keep secrets out of Git and the image; Docker administrators can inspect container environment variables.
 
-## Connect an MCP client
+Both options serve `http://127.0.0.1:8765/mcp`. Start **one** of them. Repeated `docker compose up` in the same project reuses its service; a second listener cannot take the same port. Stdio is still available, but starts a process per client. Do not expose the local bearer endpoint to the network.
 
-In your MCP client's configuration, add this entry and replace the hostname, database and username. Supply `MSSQL_PASSWORD` to the child process through your client's secret store or inherited environment. If the client does not inherit your `PATH`, use the full path to the executable.
+## 3. Connect your clients
+
+Launch each client with the **same `MSSQL_MCP_TOKEN`** in its environment. Replace any existing stdio entry for this server.
+
+### Claude Code
+
+Add to the project’s `.mcp.json`, then approve the server when Claude Code prompts:
 
 ```json
 {
   "mcpServers": {
     "sql-server": {
-      "command": "mssql-mcp",
-      "env": {
-        "MSSQL_HOST": "sql.example.com",
-        "MSSQL_DATABASE": "Inventory",
-        "MSSQL_AUTH": "sql",
-        "MSSQL_USER": "mcp_reader",
-        "MSSQL_MODE": "read"
-      }
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": { "Authorization": "Bearer ${MSSQL_MCP_TOKEN}" }
     }
   }
 }
 ```
 
-### Authentication
+Check the connection with `claude mcp get sql-server`.
 
-| `MSSQL_AUTH` | Identity | Additional environment variables |
-|---|---|---|
-| `sql` (default) | SQL Server login | `MSSQL_USER`, `MSSQL_PASSWORD` |
-| `windows` | Current Windows process identity via SSPI/NTLM | None. Windows only. Does not support Kerberos-only servers. |
-| `ntlm` | Explicit Windows domain credentials | `MSSQL_DOMAIN`, `MSSQL_USER`, `MSSQL_PASSWORD`. Use an unqualified username and set the domain separately. Available on Windows and Unix. |
+### Codex
 
-Windows/NTLM require SQL Server to recognize the Windows principal and accept NTLM. `windows` does not use `MSSQL_USER` or `MSSQL_PASSWORD`. No authentication mode falls back to another identity.
+Add to `~/.codex/config.toml`, then run `/mcp` in Codex:
 
-`MSSQL_PORT` defaults to `1433`; use the instance's configured TCP port for a named instance. `MSSQL_TIMEOUT_SECONDS` defaults to `15` (range: 1–300) and covers the SQL Server connection and operation. The client requires TLS and validates certificates against the system trust store. Use the DNS name in the server certificate. `--trust-server-certificate` (or `MSSQL_TRUST_SERVER_CERTIFICATE=true`) keeps TLS encryption but skips identity verification; use it only for disposable local development.
-
-Run `mssql-mcp --check-config` in the same environment to validate settings without connecting. Do not add that flag to the MCP client's server entry.
-
-## Tools and permissions
-
-| `MSSQL_MODE` | Tools |
-|---|---|
-| `read` (default) | `list_tables`, `describe_table`, `select_rows` |
-| `write` | `insert_row`, `update_rows`, `delete_rows` |
-| `both` | All six tools |
-
-Tools accept structured arguments, not arbitrary T-SQL. For example, pass this to `select_rows`:
-
-```json
-{
-  "table": {"schema": "dbo", "name": "Products"},
-  "columns": ["ProductId", "Name"],
-  "filters": {"Active": true},
-  "order_by": ["ProductId"],
-  "limit": 25
-}
+```toml
+[mcp_servers.sql-server]
+url = "http://127.0.0.1:8765/mcp"
+bearer_token_env_var = "MSSQL_MCP_TOKEN"
 ```
 
-- Names are scoped to the configured database; `schema` defaults to `dbo`. Filters combine equality checks with AND. A null filter matches SQL `NULL`.
-- Selects return 25 rows by default and at most 100. Provide `order_by` with a unique key for stable offset pagination. Results contain `columns`, ordered `rows`, and a `truncated` flag. Values are SQL Server text conversions or JSON `null`; types SQL Server cannot convert to text are not supported. Text cells are capped at 1,024 UTF-16 code units. Catalog pages contain at most 100 rows.
-- Updates and deletes require at least one filter. If the statement affects more than 100 target rows, the server rolls back the transaction. This cap does not count additional effects of triggers or cascading foreign keys. If a write fails after it was sent or times out, verify the database state before retrying. A lost response is not proof of rollback.
-- Give each login only the SQL Server permissions it needs on the intended tables or views. Use a dedicated read-only principal for `read` and do not grant administrative roles. The MCP mode gates tools; it does not replace database authorization.
-- Each tool call opens a fresh connection; the server allows at most four active database operations. A busy response does not run the tool.
+### Pi, OpenCode and other clients
 
-## Audit and error contract
+- **Pi:** `pi mcp add sql-server --url http://127.0.0.1:8765/mcp --bearer-token-env-var MSSQL_MCP_TOKEN`.
+- **OpenCode:** under [`mcp.servers.sql-server`](https://opencode.ai/docs/mcp-servers/) (V2), set `type: "remote"`, the same `url`, `oauth: false`, and `headers: { "Authorization": "Bearer {env:MSSQL_MCP_TOKEN}" }`. Older versions put the entry directly under `mcp`.
+- **Other ACP hosts:** the agent or adapter must support remote Streamable HTTP MCP. Point it at the same URL and send `Authorization: Bearer <token>`.
 
-The server writes JSON Lines to stderr and keeps stdout for MCP protocol messages only. Redirect or capture stderr to retain the trail; the server writes no audit file and sends no audit messages over MCP.
+## Settings and checks
 
-```json
-{"ts":1795707647283,"event":"startup","mode":"read","auth":"sql","tls_verify":true}
-{"ts":1795707647289,"event":"tool_call","tool":"select_rows","mode":"read","status":"error","code":"connection_failed","duration_ms":1,"scope":{"schema":"dbo","table":"Items"}}
-{"ts":1795707647289,"event":"shutdown","status":"ok"}
-```
+| Option | Values |
+| --- | --- |
+| `MSSQL_AUTH` | `sql` (default): user/password. `ntlm`: domain, unqualified user and password. `windows`: current Windows identity via NTLM, unavailable in Linux Docker and on Kerberos-only servers. |
+| `MSSQL_MODE` | `read` (default), `write`, or `both`. All clients share the daemon’s SQL identity and mode. |
+| SQL connection | `MSSQL_PORT` defaults to `1433`; `MSSQL_TIMEOUT_SECONDS` defaults to `15`. Use your SQL Server DNS name and keep TLS verification on. |
 
-| Field | Meaning |
-|---|---|
-| `ts` | Unix epoch in milliseconds |
-| `event` | `startup`, `tool_call`, or `shutdown` |
-| `tool` | Known tool name; absent for an unknown tool |
-| `mode` | Effective `MSSQL_MODE` |
-| `status` | `ok` or `error` |
-| `code` | Error code when `status` is `error` |
-| `duration_ms` | Wall time from request to result |
-| `scope` | Validated target: `{"schema":"dbo","table":"Items"}`, `{"schema":"dbo"}`, or `{"catalog":true}` |
-| `rows`, `affected_rows`, `truncated` | Bounded result counters, never result data; `affected_rows: -1` marks a confirmed rollback |
-| `auth`, `tls_verify` | Startup only: authentication kind and whether TLS certificate verification is enabled (on by default) |
+Use a least-privilege login. `mssql-mcp --check-config` validates settings without connecting; `--help` lists all options. Audit records are JSON Lines on stderr and omit credentials, SQL text, and values. Errors expose `code`, `action`, `retryable`, and write outcomes; verify database state before retrying a write with `mutation_outcome: unknown`.
 
-The server records one `tool_call` per completed call handled by the server, including tool-level rejections and unknown tool names. Invalid MCP messages rejected by the transport are not audited. `scope` appears only after the arguments pass validation. Records never contain SQL text, filter or column values, credentials, host names, connection strings, result rows, raw driver messages, or tool names other than the six known ones. Validated schema and table names do appear, so treat stderr as sensitive when object names are.
-
-The stderr trail is operational evidence, not a tamper-proof or compliance audit log: the server does not sign, rotate, or persist it, and anything able to write to the process streams can alter it. Capture it with your MCP client or supervisor and apply your own retention and access controls.
-
-### Tool errors
-
-Failures include `isError: true`, human-readable `content[0].text`, and a `structuredContent` object with a stable code. A write connection failure does not say the outcome is unknown: no statement was sent.
-
-```json
-{"code":"connection_failed","message":"database operation failed","action":"check that the server is reachable and that TLS and the credentials are accepted","retryable":false}
-```
-
-| Field | Meaning |
-|---|---|
-| `code` | Stable machine-readable error code |
-| `message` | Human-readable description. On rollback, `content[0].text` retains the original JSON payload |
-| `action` | What to check or do next |
-| `retryable` | `true` only when an automatic retry is safe (a busy server that started no work) |
-| `mutation_outcome` | Write tools only: `not_attempted`, `rolled_back`, or `unknown` when the statement may have taken effect |
-
-| `code` | Cause | `mutation_outcome` |
-|---|---|---|
-| `mode_unavailable` | Tool disabled by `MSSQL_MODE` | `not_attempted` for writes |
-| `invalid_arguments` | Arguments do not match the tool input schema | `not_attempted` for writes |
-| `invalid_input` | A validated field was rejected (identifier, limit, filter, value) | `not_attempted` for writes |
-| `database_busy` | Four operations were already active; nothing ran | `not_attempted` for writes |
-| `connection_failed` | TCP, TLS, or login failed before any statement | `not_attempted` for writes |
-| `authentication_unavailable` | Authentication mode missing from this build or platform | `not_attempted` for writes |
-| `query_failed` | SQL Server failed the statement | `unknown` for writes |
-| `timeout` | The operation deadline elapsed | `unknown` for writes |
-| `unrecognized_result` | The driver returned an unexpected result shape | `unknown` for writes |
-| `mutation_rolled_back` | More than 100 rows would change, so the transaction rolled back | `rolled_back` |
-
-`mutation_outcome: unknown` means the request may have reached SQL Server: read the current database state before retrying a write. A rollback result keeps its `affected_rows: -1` and `error` fields alongside the fields above. An unknown tool name stays a JSON-RPC `-32601` error with `data.code: "unknown_tool"`.
-
-## Verify
-
-GitHub Actions (`.github/workflows/ci.yml`) checks formatting, tests and Clippy on Linux and Windows. The Linux jobs also check Rust 1.88, verify the Cargo package, and exercise audit and rollback against a pinned SQL Server 2022 image. The workflow runs on pushes, pull requests and manual dispatch; it does not deploy or publish.
-
-To run the basic checks locally:
-
-```sh
-cargo fmt --all --check
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo package --locked
-```
-
-To exercise SQL authentication, verified TLS rejection, metadata reads and mutations against SQL Server 2022 locally, run:
-
-```sh
-cargo build --locked
-docker pull mcr.microsoft.com/mssql/server:2022-latest
-python3 tests/sql_server_live.py
-```
-
-The test accepts the SQL Server Developer container EULA, publishes a random port on loopback, and removes its disposable container. It does not use an existing database. To validate `windows` and `ntlm` end to end, use a Windows/AD-enabled SQL Server that accepts NTLM; the container test does not cover domain authentication.
+Run `cargo test --locked` locally. [CI](.github/workflows/ci.yml) also verifies the Cargo package and tests one Dockerized MCP with two clients against SQL Server 2022.
