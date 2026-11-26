@@ -149,6 +149,7 @@ pub struct SelectRows {
     pub columns: Vec<String>,
     /// Equality filters combined with AND; null matches SQL NULL.
     #[serde(default)]
+    #[schemars(length(max = 16))]
     pub filters: BTreeMap<String, Value>,
     /// Ascending sort columns, at most 16; required when offset is set.
     #[serde(default)]
@@ -367,6 +368,7 @@ pub struct InsertRow {
     /// Table or view that receives the row.
     pub table: Table,
     /// Column values to insert, 1–16 entries. SQL Server can implicitly convert numbers to text; use JSON strings to specify the exact text.
+    #[schemars(length(max = 16))]
     pub values: BTreeMap<String, Value>,
 }
 
