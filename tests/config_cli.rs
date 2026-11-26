@@ -55,8 +55,15 @@ fn sql_auth_and_read_mode_are_the_defaults() {
     assert!(out.stderr.is_empty());
 }
 
+const NTLM_DOMAIN_ERROR: &[u8] =
+    b"Configuration error: NTLM requires the domain in MSSQL_USER as DOMAIN\\user, not only the user name\n";
+const SQL_DOMAIN_ERROR: &[u8] =
+    b"Configuration error: SQL authentication cannot use a qualified MSSQL_USER: the DOMAIN\\user principal needs --auth ntlm\n";
+const EMPTY_PART_ERROR: &[u8] =
+    b"Configuration error: MSSQL_USER must be DOMAIN\\user with a non-empty domain and user\n";
+
 #[test]
-fn explicit_ntlm_requires_its_own_domain() {
+fn explicit_ntlm_requires_the_domain_in_the_user_string() {
     let env = [
         ("MSSQL_USER", "user"),
         ("MSSQL_PASSWORD", "never-print-this"),
@@ -67,11 +74,89 @@ fn explicit_ntlm_requires_its_own_domain() {
     );
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
+    assert_eq!(out.stderr, NTLM_DOMAIN_ERROR);
+}
+
+#[test]
+fn explicit_sql_rejects_a_qualified_user_instead_of_guessing() {
+    let env = [
+        ("MSSQL_USER", "BSOFTSOLUTION\\jcaiza"),
+        ("MSSQL_PASSWORD", "never-print-this"),
+    ];
+    let out = run(
+        &[CONNECTION, &["--auth", "sql", "--check-config"]].concat(),
+        &env,
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(out.stderr, SQL_DOMAIN_ERROR);
+}
+
+#[test]
+fn a_qualified_user_selects_ntlm_when_the_auth_flag_is_absent() {
+    let env = [
+        ("MSSQL_USER", "BSOFTSOLUTION\\jcaiza"),
+        ("MSSQL_PASSWORD", "never-print-this"),
+    ];
+    let out = run(&[CONNECTION, &["--check-config"]].concat(), &env);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"Configuration valid (auth=ntlm, mode=read)\n");
+    assert!(out.stderr.is_empty());
+
+    // Without a backslash the same omitted flag keeps the SQL login.
+    let env = [
+        ("MSSQL_USER", "jcaiza"),
+        ("MSSQL_PASSWORD", "never-print-this"),
+    ];
+    let out = run(&[CONNECTION, &["--check-config"]].concat(), &env);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"Configuration valid (auth=sql, mode=read)\n");
+    assert!(out.stderr.is_empty());
+
+    // Detection is not a bypass: an absent user string still fails like SQL.
+    let env = [("MSSQL_PASSWORD", "never-print-this")];
+    let out = run(&[CONNECTION, &["--check-config"]].concat(), &env);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
     assert_eq!(
         out.stderr,
-        b"Configuration error: MSSQL_DOMAIN is required for NTLM
-"
+        b"Configuration error: MSSQL_USER is required for SQL authentication\n"
     );
+}
+
+#[test]
+fn the_removed_domain_variable_has_no_effect() {
+    // An unqualified user stays a SQL login even with MSSQL_DOMAIN set, because
+    // the variable is no longer read.
+    let env = [
+        ("MSSQL_USER", "jcaiza"),
+        ("MSSQL_PASSWORD", "never-print-this"),
+        ("MSSQL_DOMAIN", "BSOFTSOLUTION"),
+    ];
+    let out = run(&[CONNECTION, &["--check-config"]].concat(), &env);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"Configuration valid (auth=sql, mode=read)\n");
+    assert!(out.stderr.is_empty());
+
+    // Nor can it satisfy `--auth ntlm`: the domain belongs in MSSQL_USER.
+    let out = run(
+        &[CONNECTION, &["--auth", "ntlm", "--check-config"]].concat(),
+        &env,
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(out.stderr, NTLM_DOMAIN_ERROR);
+}
+
+#[test]
+fn a_backslash_needs_a_domain_and_a_user_around_it() {
+    for user in ["\\jcaiza", "BSOFTSOLUTION\\"] {
+        let env = [("MSSQL_USER", user), ("MSSQL_PASSWORD", "never-print-this")];
+        let out = run(&[CONNECTION, &["--check-config"]].concat(), &env);
+        assert_eq!(out.status.code(), Some(2), "{user:?} was accepted");
+        assert!(out.stdout.is_empty(), "{user:?} was accepted");
+        assert_eq!(out.stderr, EMPTY_PART_ERROR, "{user:?}");
+    }
 }
 
 #[test]
@@ -81,8 +166,7 @@ fn explicit_ntlm_and_write_mode_can_be_configured_via_env() {
         ("MSSQL_DATABASE", "test"),
         ("MSSQL_AUTH", "ntlm"),
         ("MSSQL_MODE", "write"),
-        ("MSSQL_DOMAIN", "EXAMPLE"),
-        ("MSSQL_USER", "user"),
+        ("MSSQL_USER", "EXAMPLE\\user"),
         ("MSSQL_PASSWORD", "never-print-this"),
     ];
     let out = run(&["--check-config"], &env);
@@ -274,6 +358,21 @@ fn help_documents_the_yolo_opt_out() {
     assert!(
         help.contains("MSSQL_MCP_YOLO"),
         "help must document the yolo environment variable: {help}"
+    );
+}
+
+#[test]
+fn help_documents_detection_instead_of_a_sql_default() {
+    let out = run(&["--help"], &[]);
+    assert_eq!(out.status.code(), Some(0));
+    let help = String::from_utf8(out.stdout).expect("help output is UTF-8");
+    assert!(
+        !help.contains("[default: sql]"),
+        "an omitted auth flag must not claim an implicit default: {help}"
+    );
+    assert!(
+        help.contains("selects NTLM when this flag is absent"),
+        "help must document the detection from MSSQL_USER: {help}"
     );
 }
 

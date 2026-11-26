@@ -18,8 +18,6 @@ services:
       MSSQL_HOST: "${MSSQL_HOST:?MSSQL_HOST is required}"
       MSSQL_PORT: "${MSSQL_PORT:-1433}"
       MSSQL_DATABASE: "${MSSQL_DATABASE:?MSSQL_DATABASE is required}"
-      MSSQL_AUTH: "${MSSQL_AUTH:-sql}"
-      MSSQL_DOMAIN: "${MSSQL_DOMAIN:-}"
       MSSQL_USER: "${MSSQL_USER:?MSSQL_USER is required}"
       MSSQL_PASSWORD: "${MSSQL_PASSWORD:?MSSQL_PASSWORD is required}"
       MSSQL_MODE: "${MSSQL_MODE:-read}"
