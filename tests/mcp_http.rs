@@ -807,12 +807,23 @@ fn send(addr: SocketAddr, outgoing: Outgoing) -> Response {
     stream
         .set_write_timeout(Some(IO_TIMEOUT))
         .expect("set write timeout");
-    stream
-        .write_all(head.as_bytes())
-        .expect("write the request head");
     let mut reader = stream.try_clone().expect("clone the connection");
+    if outgoing.chunked {
+        stream
+            .write_all(head.as_bytes())
+            .expect("write the request head");
+        stream.flush().expect("flush the request head");
+    }
     let pending = thread::spawn(move || read_response(&mut reader));
-    let written = write_body(&mut stream, &outgoing.body, outgoing.chunked);
+    let written = if outgoing.chunked {
+        write_body(&mut stream, &outgoing.body, true)
+    } else {
+        let mut request = head.into_bytes();
+        request.extend_from_slice(&outgoing.body);
+        stream.write_all(&request).expect("write the request");
+        stream.flush().expect("flush the request");
+        Ok(())
+    };
     match pending.join().expect("response reader") {
         Ok(response) => response,
         Err(error) => {
