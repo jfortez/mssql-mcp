@@ -324,7 +324,8 @@ fn startup_and_shutdown_records_describe_static_config() {
 
 #[test]
 fn write_connection_failure_is_audited_as_not_attempted() {
-    let mut server = Server::start("write", closed_port());
+    let (port, _peer) = support::dropping_peer();
+    let mut server = Server::start("write", port);
     let response = server.call_tool(
         "delete_rows",
         json!({"table": {"name": "Items"}, "filters": {"id": 1}}),
@@ -347,7 +348,8 @@ fn write_connection_failure_is_audited_as_not_attempted() {
 
 #[test]
 fn validated_scope_is_audited_without_queries_or_values() {
-    let mut server = Server::start("both", closed_port());
+    let (port, _peer) = support::dropping_peer();
+    let mut server = Server::start("both", port);
     let response = server.call_tool(
         "select_rows",
         json!({

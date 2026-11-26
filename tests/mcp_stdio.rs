@@ -326,7 +326,7 @@ fn disallowed_tools_are_rejected_without_connecting() {
 
 #[test]
 fn valid_read_against_closed_loopback_returns_a_sanitized_error() {
-    let port = closed_port();
+    let (port, _peer) = support::dropping_peer();
     let mut server = McpServer::start("read", port);
     let result = server.call_tool("list_tables", json!({"schema": "dbo"}));
     let text = tool_error_text(&result);

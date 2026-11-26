@@ -537,7 +537,7 @@ impl Drop for Daemon {
 }
 
 fn daemon_command(addr: SocketAddr, mode: &str, extra: &[String]) -> Command {
-    let database_port = free_loopback_port();
+    let (database_port, _peer) = support::dropping_peer();
     let mut command = Command::new(env!("CARGO_BIN_EXE_mssql-mcp"));
     support::clear_env(&mut command)
         .env("MSSQL_USER", "sa")
