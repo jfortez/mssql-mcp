@@ -172,7 +172,7 @@ impl Cli {
     }
 }
 
-/// Bearer token for the HTTP transport; it is only accepted from the environment.
+/// Accepted only from the environment.
 fn http_token() -> Result<String, &'static str> {
     let token = required(
         "MSSQL_MCP_TOKEN",

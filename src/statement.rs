@@ -13,7 +13,6 @@ const MAX_TEXT_UNITS: usize = 1025;
 const IDENTIFIER_ERROR: &str =
     "identifier must contain 1–128 UTF-16 units and no control characters";
 
-/// A single T-SQL batch with values bound by position.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Statement {
     pub sql: String,

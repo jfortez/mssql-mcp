@@ -23,14 +23,12 @@ const MUTATION_COLUMN: &str = "affected_rows";
 
 type Connection = Client<Compat<TcpStream>>;
 
-/// Result of a bounded read operation.
 pub struct ReadOutput {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
     pub truncated: bool,
 }
 
-/// The single outcome of a planned statement.
 pub enum Outcome {
     Read(ReadOutput),
     Mutation(i64),

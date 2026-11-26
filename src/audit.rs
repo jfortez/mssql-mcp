@@ -14,7 +14,6 @@ use serde::Serialize;
 
 use crate::config::Mode;
 
-/// Outcome of a lifecycle step or tool call.
 #[derive(Clone, Copy)]
 pub enum Status {
     Ok,
@@ -67,7 +66,6 @@ impl<'a> Scope<'a> {
     }
 }
 
-/// Completed tool call to record.
 pub struct CallRecord<'a> {
     pub tool: Option<&'static str>,
     pub mode: Mode,

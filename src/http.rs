@@ -37,7 +37,6 @@ const UNAUTHORIZED_BODY: &str = r#"{"code":"unauthorized","message":"send exactl
 
 pub async fn run(mut settings: Settings) -> Result<(), String> {
     let listen = settings.http_listen;
-    // The token is moved out of the settings so only the access gate holds it.
     let Some(token) = settings.token.take() else {
         return Err("MSSQL_MCP_TOKEN is required for the HTTP transport".to_owned());
     };
