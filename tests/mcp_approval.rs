@@ -26,13 +26,6 @@ const CONNECTION_GRACE: Duration = Duration::from_millis(100);
 const VALUE_MARKER: &str = "approval-value-marker-1f4b";
 const FILTER_MARKER: &str = "approval-filter-marker-8c2d";
 
-fn closed_port() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
-    let port = listener.local_addr().expect("loopback address").port();
-    drop(listener);
-    port
-}
-
 /// Loopback peer that counts every accepted TCP connection and closes it, so an
 /// attempted database connection is both visible and harmless.
 struct CountingPeer {
@@ -383,7 +376,7 @@ fn initialize_instructions_explain_the_gate_without_changing_it() {
     }
 
     // Read mode advertises the same discovery text it can actually honour.
-    let server = Server::start("read", closed_port(), Yolo::Off, false);
+    let server = Server::start("read", support::unique_loopback_port(), Yolo::Off, false);
     let instructions = server.initialize["result"]["instructions"]
         .as_str()
         .unwrap_or_else(|| panic!("read: no instructions: {}", server.initialize));
@@ -630,7 +623,7 @@ fn yolo_skips_the_prompt_and_reaches_the_database() {
 
 #[test]
 fn validation_rejections_are_reported_before_the_gate() {
-    let mut server = Server::start("write", closed_port(), Yolo::Off, true);
+    let mut server = Server::start("write", support::unique_loopback_port(), Yolo::Off, true);
     let result = server.call_tool(
         "insert_row",
         json!({"table": {"name": "Items"}, "values": {}}),

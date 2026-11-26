@@ -6,7 +6,6 @@
 //! tool never asks for approval.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -21,13 +20,6 @@ mod support;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const PASSWORD: &str = "schema-test-password-c92a";
 const HOST: &str = "127.0.0.1";
-
-fn closed_port() -> u16 {
-    let listener = TcpListener::bind((HOST, 0)).expect("bind loopback");
-    let port = listener.local_addr().expect("loopback address").port();
-    drop(listener);
-    port
-}
 
 struct Server {
     child: Child,
@@ -270,7 +262,7 @@ fn error_text(result: &Value) -> &str {
 #[test]
 fn explore_schema_is_listed_in_every_mode() {
     for mode in ["read", "write", "both"] {
-        let mut server = Server::start(mode, closed_port(), false);
+        let mut server = Server::start(mode, support::unique_loopback_port(), false);
         assert!(
             server
                 .tool_names()
@@ -353,7 +345,7 @@ fn definition_is_accepted_in_read_mode_without_approval() {
 
 #[test]
 fn invalid_arguments_are_rejected_before_connecting() {
-    let mut server = Server::start("read", closed_port(), false);
+    let mut server = Server::start("read", support::unique_loopback_port(), false);
     for (arguments, message, code) in [
         (
             json!({"schema": "bad\u{7}name"}),

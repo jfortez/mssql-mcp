@@ -9,7 +9,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 
 mod support;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -440,7 +440,7 @@ fn concurrent_clients_share_the_same_daemon() {
 
 #[test]
 fn an_explicit_non_loopback_bind_is_served_with_authentication() {
-    let bind = SocketAddr::from(([0, 0, 0, 0], free_loopback_port()));
+    let bind = SocketAddr::from(([0, 0, 0, 0], support::unique_loopback_port()));
     let mut daemon = Daemon::start_on(bind, "read");
     assert!(
         daemon.is_running(),
@@ -536,7 +536,7 @@ struct Daemon {
 
 impl Daemon {
     fn start(mode: &str) -> Self {
-        let bind = SocketAddr::from(([127, 0, 0, 1], free_loopback_port()));
+        let bind = SocketAddr::from(([127, 0, 0, 1], support::unique_loopback_port()));
         Self::start_on(bind, mode)
     }
 
@@ -682,11 +682,6 @@ fn capture<R: Read + Send + 'static>(reader: R) -> Arc<Mutex<Vec<String>>> {
     lines
 }
 
-fn free_loopback_port() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
-    listener.local_addr().expect("loopback address").port()
-}
-
 fn initialize(id: u64, client: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -784,7 +779,35 @@ impl Response {
     }
 }
 
+/// Send one request over a fresh connection.
+///
 fn send(addr: SocketAddr, outgoing: Outgoing) -> Response {
+    let mut last = None;
+    for _ in 0..3 {
+        match attempt(addr, &outgoing) {
+            Ok(response) => return response,
+            Err(error) if is_transient(&error) => last = Some(error),
+            Err(error) => panic!("no HTTP response from {addr}: {error}"),
+        }
+    }
+    panic!(
+        "no HTTP response from {addr}: {}",
+        last.expect("a transient error")
+    );
+}
+
+/// A fresh connection that the daemon closed while starting or accepting is a
+/// transient harness condition; a real HTTP failure still returns a response.
+fn is_transient(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
+fn attempt(addr: SocketAddr, outgoing: &Outgoing) -> io::Result<Response> {
     let mut head = format!("{} {} HTTP/1.1\r\n", outgoing.method, outgoing.path);
     if !outgoing
         .headers
@@ -804,20 +827,13 @@ fn send(addr: SocketAddr, outgoing: Outgoing) -> Response {
     }
     head.push_str("\r\n");
 
-    let mut stream =
-        TcpStream::connect_timeout(&addr, IO_TIMEOUT).expect("connect to the HTTP daemon");
-    stream
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .expect("set read timeout");
-    stream
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .expect("set write timeout");
-    let mut reader = stream.try_clone().expect("clone the connection");
+    let mut stream = TcpStream::connect_timeout(&addr, IO_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    let mut reader = stream.try_clone()?;
     if outgoing.chunked {
-        stream
-            .write_all(head.as_bytes())
-            .expect("write the request head");
-        stream.flush().expect("flush the request head");
+        stream.write_all(head.as_bytes())?;
+        stream.flush()?;
     }
     let pending = thread::spawn(move || read_response(&mut reader));
     let written = if outgoing.chunked {
@@ -825,14 +841,18 @@ fn send(addr: SocketAddr, outgoing: Outgoing) -> Response {
     } else {
         let mut request = head.into_bytes();
         request.extend_from_slice(&outgoing.body);
-        stream.write_all(&request).expect("write the request");
-        stream.flush().expect("flush the request");
-        Ok(())
+        stream.write_all(&request)?;
+        stream.flush()
     };
     match pending.join().expect("response reader") {
-        Ok(response) => response,
+        Ok(response) => Ok(response),
         Err(error) => {
-            panic!("no HTTP response from {addr} after writing {written:?}: {error}")
+            if let Err(write_error) = &written {
+                return Err(io::Error::new(write_error.kind(), write_error.to_string()));
+            }
+            Err(io::Error::other(format!(
+                "no response after writing {written:?}: {error}"
+            )))
         }
     }
 }

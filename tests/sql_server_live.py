@@ -376,6 +376,11 @@ def verify(binary, host, port, reader, writer):
 
     with server(binary, host, port, "mcp_writer", writer, "both", trust=True, yolo=True) as client:
         verify_read_regressions(client, table)
+        procedure_as_table = client.tool("schema_map", {"table": {"name": "usp_items_count"}})
+        assert procedure_as_table["total"] == 0, procedure_as_table
+        named = client.tool("schema_map", {"table": table})
+        assert any(entry["kind"] == "object" and entry["name"] == "Items"
+                   for entry in named["entries"]), named
         typed = {"name": "TypedReads"}
         columns = ["id", "bytes", "document"]
         result = client.tool("select_rows", {"table": typed, "columns": columns, "limit": 1})

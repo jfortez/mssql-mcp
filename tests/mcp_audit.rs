@@ -1,5 +1,4 @@
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
@@ -15,13 +14,6 @@ const MAX_AUDIT_LINES: usize = 64;
 const USER: &str = "audit-user";
 const PASSWORD: &str = "audit-marker-password-9f2c";
 const DOMAIN: &str = "AUDITDOMAIN";
-
-fn closed_port() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
-    let port = listener.local_addr().expect("loopback address").port();
-    drop(listener);
-    port
-}
 
 #[derive(Debug)]
 struct Audit {
@@ -293,7 +285,7 @@ fn error_of(result: &Value) -> &Value {
 
 #[test]
 fn startup_and_shutdown_records_describe_static_config() {
-    let port = closed_port();
+    let port = support::unique_loopback_port();
     let mut server = Server::spawn("read", port, "sql", false, true);
     let startup = server.next_audit();
     assert_eq!(startup.json["mode"], "read", "{}", startup.raw);
@@ -481,7 +473,7 @@ fn validated_scope_is_audited_without_queries_or_values() {
 #[test]
 fn filter_values_and_credentials_stay_out_of_audit_and_errors() {
     const MARKER: &str = "sensitive-marker-3f7a";
-    let mut server = Server::start("read", closed_port());
+    let mut server = Server::start("read", support::unique_loopback_port());
     let response = server.call_tool(
         "select_rows",
         json!({
@@ -511,7 +503,7 @@ fn filter_values_and_credentials_stay_out_of_audit_and_errors() {
 
 #[test]
 fn unvalidated_targets_are_not_audited() {
-    let mut server = Server::start("read", closed_port());
+    let mut server = Server::start("read", support::unique_loopback_port());
     let response = server.call_tool(
         "select_rows",
         json!({"table": {"name": "Bad\u{7}Name"}, "columns": ["id"]}),
@@ -557,7 +549,7 @@ fn unvalidated_targets_are_not_audited() {
 
 #[test]
 fn denied_mutations_are_audited_as_not_attempted() {
-    let mut server = Server::start("read", closed_port());
+    let mut server = Server::start("read", support::unique_loopback_port());
     let response = server.call_tool(
         "insert_row",
         json!({"table": {"name": "Items"}, "values": {"id": 1}}),
@@ -580,7 +572,7 @@ fn denied_mutations_are_audited_as_not_attempted() {
 #[test]
 fn unknown_tools_keep_json_rpc_errors_and_are_not_named_in_audit() {
     const NAME: &str = "audit-unknown-tool-xyz";
-    let mut server = Server::start("read", closed_port());
+    let mut server = Server::start("read", support::unique_loopback_port());
     let response = server.request("tools/call", json!({"name": NAME, "arguments": {}}));
     assert_eq!(response["error"]["code"], -32601, "{response}");
     assert_eq!(response["error"]["message"], "tools/call", "{response}");

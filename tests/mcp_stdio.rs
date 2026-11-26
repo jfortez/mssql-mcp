@@ -1,5 +1,4 @@
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
@@ -44,13 +43,6 @@ const ALL_TOOLS: &[&str] = &[
     "table_stats",
     "sample_rows",
 ];
-
-fn closed_port() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
-    let port = listener.local_addr().expect("loopback address").port();
-    drop(listener);
-    port
-}
 
 struct McpServer {
     child: Child,
@@ -412,7 +404,7 @@ fn tools_expose_object_input_schemas() {
 
 #[test]
 fn disallowed_tools_are_rejected_without_connecting() {
-    let port = closed_port();
+    let port = support::unique_loopback_port();
     let mut server = McpServer::start("read", port);
     let result = server.call_tool(
         "insert_row",
@@ -491,7 +483,7 @@ fn valid_read_against_closed_loopback_returns_a_sanitized_error() {
 
 #[test]
 fn malformed_arguments_are_rejected_before_database_access() {
-    let port = closed_port();
+    let port = support::unique_loopback_port();
     let mut server = McpServer::start("read", port);
     let result = server.call_tool(
         "select_rows",
@@ -528,7 +520,7 @@ fn malformed_arguments_are_rejected_before_database_access() {
 
 #[test]
 fn select_reports_the_invalid_field_and_accepts_wide_projections() {
-    let mut server = McpServer::start("read", closed_port());
+    let mut server = McpServer::start("read", support::unique_loopback_port());
     for (args, field) in [
         (json!({"table": {"name": "Items"}}), "columns"),
         (
@@ -581,8 +573,8 @@ fn catalog_tools_validate_and_follow_read_mode_gating() {
             json!({"table": {"name": "Items"}}),
         ),
     ];
-    let mut read = McpServer::start("read", closed_port());
-    let mut write = McpServer::start("write", closed_port());
+    let mut read = McpServer::start("read", support::unique_loopback_port());
+    let mut write = McpServer::start("write", support::unique_loopback_port());
     for (tool, invalid, valid) in inputs {
         assert_eq!(
             structured_error(&read.call_tool(tool, invalid))["code"],
@@ -605,7 +597,7 @@ fn catalog_tools_validate_and_follow_read_mode_gating() {
 
 #[test]
 fn write_validation_rejection_is_not_attempted() {
-    let port = closed_port();
+    let port = support::unique_loopback_port();
     let mut server = McpServer::start("write", port);
     let result = server.call_tool(
         "insert_row",
