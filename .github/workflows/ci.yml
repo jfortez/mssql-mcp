@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - windows-2022
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Verify Windows native build tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere)) {
+            throw "vswhere.exe not found; MSVC build tools are unavailable."
+          }
+          $install = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $install) {
+            throw "MSVC C++ build tools are unavailable."
+          }
+          cmake --version
+          if (Get-Command nasm -ErrorAction SilentlyContinue) {
+            nasm -v
+          } else {
+            Write-Host "NASM is not installed; aws-lc-rs uses its bundled prebuilt NASM objects."
+          }
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+
+      - name: Check formatting
+        run: cargo +stable fmt --all --check
+
+      - name: Run tests
+        run: cargo +stable test --locked
+
+      - name: Run Clippy
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+
+  minimum-rust-and-package:
+    name: Minimum Rust and package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup toolchain install stable --profile minimal
+
+      - name: Check minimum supported Rust version
+        run: cargo +1.88.0 check --locked --all-targets
+
+      - name: Verify Cargo package
+        run: cargo +stable package --locked
+
+  sql-server-live:
+    name: SQL Server live fixture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SQL_SERVER_IMAGE: mcr.microsoft.com/mssql/server@sha256:4525e3efac9f3e241cb003bb2ff2a82818b502f37e12049d788b1a9fa7e13b7f
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build release binary
+        run: cargo +stable build --release --locked
+
+      - name: Pull pinned SQL Server image
+        run: docker pull "$SQL_SERVER_IMAGE"
+
+      - name: Run live SQL Server checks
+        run: python3 -u tests/sql_server_live.py --binary target/release/mssql-mcp --image "$SQL_SERVER_IMAGE"

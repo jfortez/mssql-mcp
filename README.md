@@ -132,6 +132,10 @@ Failures include `isError: true`, human-readable `content[0].text`, and a `struc
 
 ## Verify
 
+GitHub Actions (`.github/workflows/ci.yml`) checks formatting, tests and Clippy on Linux and Windows. The Linux jobs also check Rust 1.88, verify the Cargo package, and exercise audit and rollback against a pinned SQL Server 2022 image. The workflow runs on pushes, pull requests and manual dispatch; it does not deploy or publish.
+
+To run the basic checks locally:
+
 ```sh
 cargo fmt --all --check
 cargo test --locked
