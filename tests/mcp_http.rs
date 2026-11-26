@@ -104,6 +104,7 @@ fn one_daemon_serves_independent_clients() {
         daemon.is_running(),
         "the shared daemon must stay alive between clients"
     );
+    wait_for_tool_calls(&daemon, 2);
     let stderr = daemon.stderr_text();
     assert!(
         stderr.contains("\"event\":\"startup\""),
@@ -270,6 +271,7 @@ fn foreign_origin_and_host_are_rejected_before_dispatch() {
         "a client without Origin must be allowed: {}",
         accepted.text()
     );
+    wait_for_tool_calls(&daemon, 1);
     let stderr = daemon.stderr_text();
     assert_eq!(
         stderr.matches("\"event\":\"tool_call\"").count(),
@@ -636,6 +638,21 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
             None if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             None => return None,
         }
+    }
+}
+
+fn wait_for_tool_calls(daemon: &Daemon, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if daemon
+            .stderr_text()
+            .matches("\"event\":\"tool_call\"")
+            .count()
+            >= expected
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 

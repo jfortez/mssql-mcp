@@ -268,6 +268,7 @@ def verify(binary, host, port, reader, writer):
         page = {"table": table, "columns": ["id"], "order_by": ["id"], "limit": 1,
                 "offset": 100, "filters": {"group_id": 1}}
         assert client.tool("select_rows", page)["rows"] == [["101"]]
+        rollback_client = client
 
         tree = client.tool("explore_schema", {"definition": True})
         payload, text = tree, tree["tree"]
@@ -319,6 +320,9 @@ def verify(binary, host, port, reader, writer):
         assert client.tool("query", {"sql": "DROP TABLE probe.Doomed"}) == {"executed": True}
         assert all(row[1] != "Doomed" for row in client.tool("list_tables", {})["rows"])
     print("PASS: an approved bypass really deletes every row, truncates and drops")
+    reverted = next(record for record in audit_calls(rollback_client) if record.get("code") == "mutation_rolled_back")
+    assert (reverted["tool"], reverted["status"], reverted["affected_rows"]) == ("delete_rows", "error", -1), reverted
+    assert reverted["approval"] == "yolo", reverted
     for audit in audit_calls(client):
         if audit.get("tool") == "query":
             assert "sql" not in audit and "DROP" not in str(audit).upper(), audit
@@ -330,9 +334,6 @@ def verify(binary, host, port, reader, writer):
     query_audit = next(record for record in audit_calls(client) if record["tool"] == "query")
     assert "sql" not in query_audit and "SELECT 1" not in str(query_audit), query_audit
     print("PASS: query is refused without approval and its text stays out of the audit record")
-    reverted = next(record for record in audit_calls(client) if record.get("code") == "mutation_rolled_back")
-    assert (reverted["tool"], reverted["status"], reverted["affected_rows"]) == ("delete_rows", "error", -1), reverted
-    assert reverted["approval"] == "yolo", reverted
     print("PASS: write/both, INSERT/UPDATE/DELETE, NULL, sorted paging, audited rollback and value redaction")
 
 
