@@ -475,12 +475,13 @@ fn object_sql(filter: &MapFilter, binder: &mut Binder) -> Result<KindSql, &'stat
 fn column_sql(filter: &MapFilter, binder: &mut Binder) -> Result<KindSql, &'static str> {
     let types = filter.include.table_types();
     let predicate = filter.predicate(binder, "s.name", "o.name", "o.type", &types)?;
-    let data_type = type_expression("c", "t");
+    let data_type = type_expression("c", "t", "b");
     let from_where = format!(
         "FROM sys.columns AS c \
          JOIN sys.objects AS o ON o.object_id = c.object_id \
          JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
-         JOIN sys.types AS t ON t.user_type_id = c.user_type_id \
+         LEFT JOIN sys.types AS t ON t.user_type_id = c.user_type_id \
+         LEFT JOIN sys.types AS b ON b.user_type_id = c.system_type_id \
          LEFT JOIN sys.default_constraints AS dc \
            ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id \
          LEFT JOIN sys.computed_columns AS cc \
@@ -677,7 +678,7 @@ fn index_column_sql(filter: &MapFilter, binder: &mut Binder) -> Result<KindSql, 
 fn parameter_sql(filter: &MapFilter, binder: &mut Binder) -> Result<KindSql, &'static str> {
     let types = filter.include.routine_types();
     let predicate = filter.predicate(binder, "s.name", "o.name", "o.type", &types)?;
-    let data_type = type_expression("p", "t");
+    let data_type = type_expression("p", "t", "b");
     Ok(KindSql {
         projection: format!(
             "CONVERT(nvarchar(20), p.object_id) AS [object_id], \
@@ -692,7 +693,8 @@ fn parameter_sql(filter: &MapFilter, binder: &mut Binder) -> Result<KindSql, &'s
             "FROM sys.parameters AS p \
              JOIN sys.objects AS o ON o.object_id = p.object_id \
              JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
-             JOIN sys.types AS t ON t.user_type_id = p.user_type_id \
+             LEFT JOIN sys.types AS t ON t.user_type_id = p.user_type_id \
+             LEFT JOIN sys.types AS b ON b.user_type_id = p.system_type_id \
              WHERE o.is_ms_shipped = 0 AND {predicate}"
         ),
         order_by: "p.object_id, p.parameter_id".to_owned(),

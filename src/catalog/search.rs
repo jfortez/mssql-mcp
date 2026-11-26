@@ -86,7 +86,8 @@ impl SearchObjects {
                  FROM sys.columns AS c \
                  JOIN sys.objects AS o ON o.object_id = c.object_id \
                  JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
-                 JOIN sys.types AS t ON t.user_type_id = c.user_type_id \
+                 LEFT JOIN sys.types AS t ON t.user_type_id = c.user_type_id \
+                 LEFT JOIN sys.types AS b ON b.user_type_id = c.system_type_id \
                  WHERE o.is_ms_shipped = 0 AND o.type IN (N'U', N'V') \
                    AND CHARINDEX({query_parameter}, CONVERT(nvarchar(128), c.name)) > 0 \
                    AND ({schema_parameter} IS NULL OR s.name = {schema_parameter})"
@@ -125,7 +126,7 @@ impl SearchObjects {
             let mut binder = Binder::default();
             let query = binder.bind(Value::String(self.query.clone()))?;
             let schema = bind_schema(&mut binder, self.schema.as_ref())?;
-            let data_type = type_expression("c", "t");
+            let data_type = type_expression("c", "t", "b");
             pages.push(PageQuery::new(
                 "column",
                 format!(
@@ -141,7 +142,8 @@ impl SearchObjects {
                      FROM sys.columns AS c \
                      JOIN sys.objects AS o ON o.object_id = c.object_id \
                      JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
-                     JOIN sys.types AS t ON t.user_type_id = c.user_type_id \
+                     LEFT JOIN sys.types AS t ON t.user_type_id = c.user_type_id \
+                 LEFT JOIN sys.types AS b ON b.user_type_id = c.system_type_id \
                      WHERE o.is_ms_shipped = 0 AND o.type IN (N'U', N'V') \
                        AND CHARINDEX({query}, CONVERT(nvarchar(128), c.name)) > 0 \
                        AND ({schema} IS NULL OR s.name = {schema}) \

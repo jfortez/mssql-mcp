@@ -204,17 +204,22 @@ pub(super) fn object_type(code: &str) -> Option<ObjectType> {
 }
 
 /// A safe SQL expression for a formatted type with length/precision/scale.
-/// `value` is the column/parameter alias, `ty` its joined `sys.types` alias.
-pub(super) fn type_expression(value: &str, ty: &str) -> String {
+///
+/// `value` is the column/parameter alias. `declared` and `base` are the joined
+/// `sys.types` aliases for the declared user type and the underlying system
+/// type. They are joined with `LEFT JOIN` because SQL Server hides a
+/// user-defined type from a login without permission on it; the base type still
+/// names the column, and the declared alias is used when it is visible.
+pub(super) fn type_expression(value: &str, declared: &str, base: &str) -> String {
     format!(
-        "{ty}.name + CASE \
-         WHEN {ty}.name IN (N'nvarchar', N'nchar') THEN \
+        "ISNULL({declared}.name, {base}.name) + CASE \
+         WHEN {base}.name IN (N'nvarchar', N'nchar') THEN \
              N'(' + CASE WHEN {value}.max_length = -1 THEN N'max' ELSE CONVERT(nvarchar(10), {value}.max_length / 2) END + N')' \
-         WHEN {ty}.name IN (N'varchar', N'char', N'varbinary', N'binary') THEN \
+         WHEN {base}.name IN (N'varchar', N'char', N'varbinary', N'binary') THEN \
              N'(' + CASE WHEN {value}.max_length = -1 THEN N'max' ELSE CONVERT(nvarchar(10), {value}.max_length) END + N')' \
-         WHEN {ty}.name IN (N'decimal', N'numeric') THEN \
+         WHEN {base}.name IN (N'decimal', N'numeric') THEN \
              N'(' + CONVERT(nvarchar(10), {value}.precision) + N',' + CONVERT(nvarchar(10), {value}.scale) + N')' \
-         WHEN {ty}.name IN (N'datetime2', N'time', N'datetimeoffset') THEN \
+         WHEN {base}.name IN (N'datetime2', N'time', N'datetimeoffset') THEN \
              N'(' + CONVERT(nvarchar(10), {value}.scale) + N')' \
          ELSE N'' END"
     )
