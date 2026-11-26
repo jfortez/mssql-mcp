@@ -87,7 +87,10 @@ def fixture(image, *, network=None, reader_password=None):
             GRANT ALTER ON SCHEMA::probe TO mcp_writer;
         """
         wide = ("CREATE TABLE dbo.Wide (" + ", ".join(f"c{i} int NULL" for i in range(120))
-                + "); GRANT VIEW DEFINITION ON dbo.Wide TO mcp_writer;")
+                + "); GRANT VIEW DEFINITION ON dbo.Wide TO mcp_writer;"
+                + " CREATE TABLE probe.Doomed (id int NOT NULL PRIMARY KEY);"
+                + " INSERT probe.Doomed VALUES (1), (2), (3);"
+                + " GRANT SELECT, DELETE ON probe.Doomed TO mcp_writer;")
         batches = [("create", create, "master"), ("schema", schema, "McpFixture"),
                    ("trigger", trigger, "McpFixture"), ("procedures", procedures, "McpFixture"),
                    ("wide", wide, "McpFixture")]
@@ -294,6 +297,31 @@ def verify(binary, host, port, reader, writer):
         gone = client.tool("query", {"sql": "SELECT OBJECT_ID('probe.usp_probe_sum') AS id"})
         assert gone["rows"] == [[None]], gone
     print("PASS: query creates, alters and drops a stored procedure under approval bypass")
+
+    with server(binary, host, port, "mcp_writer", writer, "both", trust=True) as client:
+        for statement in ("DROP TABLE probe.Doomed", "DELETE FROM probe.Doomed", "TRUNCATE TABLE probe.Doomed"):
+            refused = client.tool("query", {"sql": statement}, error=True)["result"]["structuredContent"]
+            assert refused["code"] == "approval_unavailable", (statement, refused)
+            assert refused["mutation_outcome"] == "not_attempted", (statement, refused)
+        assert client.tool("select_rows", {"table": {"schema": "probe", "name": "Doomed"}, "columns": ["id"], "order_by": ["id"]})["rows"] == [["1"], ["2"], ["3"]]
+    print("PASS: destructive SQL without approval is refused and leaves the table untouched")
+
+    with server(binary, host, port, "mcp_reader", reader, "read", trust=True) as client:
+        for statement in ("DROP TABLE dbo.Doomed", "DELETE FROM dbo.Doomed"):
+            refused = client.tool("query", {"sql": statement}, error=True)["result"]["structuredContent"]
+            assert refused["code"] == "mode_unavailable", (statement, refused)
+    print("PASS: read mode has no query tool at all")
+
+    with server(binary, host, port, "mcp_writer", writer, "both", trust=True, yolo=True) as client:
+        assert client.tool("query", {"sql": "DELETE FROM probe.Doomed"}) == {"executed": True}
+        assert client.tool("select_rows", {"table": {"schema": "probe", "name": "Doomed"}, "columns": ["id"]})["rows"] == []
+        assert client.tool("query", {"sql": "TRUNCATE TABLE probe.Doomed"}) == {"executed": True}
+        assert client.tool("query", {"sql": "DROP TABLE probe.Doomed"}) == {"executed": True}
+        assert all(row[1] != "Doomed" for row in client.tool("list_tables", {})["rows"])
+    print("PASS: an approved bypass really deletes every row, truncates and drops")
+    for audit in audit_calls(client):
+        if audit.get("tool") == "query":
+            assert "sql" not in audit and "DROP" not in str(audit).upper(), audit
 
     with server(binary, host, port, "mcp_writer", writer, "write", trust=True) as client:
         refused_query = client.tool("query", {"sql": "SELECT 1 AS n"}, error=True)
