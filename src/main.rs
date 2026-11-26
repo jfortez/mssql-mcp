@@ -3,7 +3,8 @@ use std::process::ExitCode;
 use clap::Parser;
 use mssql_mcp::config::Cli;
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let settings = match Cli::parse().settings() {
         Ok(settings) => settings,
         Err(error) => {
@@ -19,6 +20,11 @@ fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    eprintln!("MCP transport is not available yet");
-    ExitCode::FAILURE
+    match mssql_mcp::server::serve(settings).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("MCP server error: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
