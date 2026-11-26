@@ -98,6 +98,7 @@ pub enum ObjectType {
     View,
     Procedure,
     Function,
+    Trigger,
 }
 
 impl ObjectType {
@@ -109,6 +110,7 @@ impl ObjectType {
             "V" => Some(Self::View),
             "P" | "PC" => Some(Self::Procedure),
             "FN" | "IF" | "TF" | "FS" | "FT" | "AF" => Some(Self::Function),
+            "TR" => Some(Self::Trigger),
             _ => None,
         }
     }

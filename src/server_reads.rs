@@ -6,7 +6,8 @@ use serde::de::DeserializeOwned;
 
 use super::*;
 use crate::catalog::{
-    CatalogError, ObjectDependencies, ObjectName, SchemaMap, SearchObjects, TableStats,
+    CatalogError, DependencyColumns, ObjectDependencies, ObjectName, RoutineDefinition,
+    RoutineDefinitionError, SchemaMap, SearchObjects, TableStats,
 };
 use crate::database::ReadOutput;
 use crate::statement::SampleRows;
@@ -22,6 +23,18 @@ impl Scoped for SchemaMap {
 }
 
 impl Scoped for ObjectDependencies {
+    fn scope(&self) -> Scope<'_> {
+        object_scope(&self.object, None)
+    }
+}
+
+impl Scoped for RoutineDefinition {
+    fn scope(&self) -> Scope<'_> {
+        object_scope(&self.object, None)
+    }
+}
+
+impl Scoped for DependencyColumns {
     fn scope(&self) -> Scope<'_> {
         object_scope(&self.object, None)
     }
@@ -264,6 +277,24 @@ impl McpServer {
         Page: serde::Serialize,
         Exec: Future<Output = Result<Page, CatalogError>>,
     {
+        self.catalog_call_with(tool, arguments, started, plan, execute, catalog_error)
+            .await
+    }
+
+    pub(super) async fn catalog_call_with<T, Plan, Page, Exec, E>(
+        &self,
+        tool: Known,
+        arguments: JsonObject,
+        started: Instant,
+        plan: impl FnOnce(&T) -> Result<Plan, &'static str>,
+        execute: impl FnOnce(Plan) -> Exec,
+        map_error: impl FnOnce(&E) -> ToolError,
+    ) -> CallToolResult
+    where
+        T: DeserializeOwned + Scoped + Send,
+        Page: serde::Serialize,
+        Exec: Future<Output = Result<Page, E>>,
+    {
         let name = tool.name();
         let input = match serde_json::from_value(Value::Object(arguments)) {
             Ok(input) => input,
@@ -302,16 +333,26 @@ impl McpServer {
                 ),
             },
             Err(error) => {
-                let error = match error {
-                    CatalogError::NotFound => ToolError::not_found(),
-                    CatalogError::UnexpectedResult => {
-                        ToolError::from_database(DbError::UnexpectedResult, false)
-                    }
-                    CatalogError::Database(error) => ToolError::from_database(error, false),
-                };
+                let error = map_error(&error);
                 self.failed(name, started, Some(scope), error, None)
             }
         }
+    }
+
+    pub(super) async fn routine_definition_call(
+        &self,
+        arguments: JsonObject,
+        started: Instant,
+    ) -> CallToolResult {
+        self.catalog_call_with(
+            Known::RoutineDefinition,
+            arguments,
+            started,
+            RoutineDefinition::plan,
+            |plan| async move { plan.execute(&self.database).await },
+            routine_definition_error,
+        )
+        .await
     }
 
     fn emit_catalog_read(
@@ -337,6 +378,31 @@ impl McpServer {
             },
         );
         CallToolResult::structured(payload)
+    }
+}
+
+fn catalog_error(error: &CatalogError) -> ToolError {
+    match error {
+        CatalogError::NotFound => ToolError::not_found(),
+        CatalogError::UnexpectedResult => {
+            ToolError::from_database(DbError::UnexpectedResult, false)
+        }
+        CatalogError::Database(error) => ToolError::from_database(error.clone(), false),
+    }
+}
+
+fn routine_definition_error(error: &RoutineDefinitionError) -> ToolError {
+    match error {
+        RoutineDefinitionError::Database(error) => ToolError::from_database(error.clone(), false),
+        RoutineDefinitionError::MissingObject { .. } => {
+            ToolError::object_not_found(error.to_string())
+        }
+        RoutineDefinitionError::DefinitionUnavailable { .. } => {
+            ToolError::definition_unavailable(error.to_string())
+        }
+        RoutineDefinitionError::UnexpectedResult => {
+            ToolError::from_database(DbError::UnexpectedResult, false)
+        }
     }
 }
 
@@ -402,4 +468,50 @@ fn safe_field_name(key: &str) -> String {
         .filter(|character| !character.is_control())
         .take(128)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire(error: ToolError) -> Value {
+        serde_json::to_value(error.into_result()).expect("a tool error serializes to JSON")
+    }
+
+    #[test]
+    fn routine_definition_errors_keep_their_specific_code_and_names() {
+        let missing = wire(routine_definition_error(
+            &RoutineDefinitionError::MissingObject {
+                schema: "pla_monitoreo".to_owned(),
+                name: "spConsultarModelosSegmentacion".to_owned(),
+            },
+        ));
+        assert_eq!(missing["structuredContent"]["code"], OBJECT_NOT_FOUND);
+        assert!(
+            missing["structuredContent"]["message"]
+                .as_str()
+                .is_some_and(
+                    |message| message.contains("pla_monitoreo.spConsultarModelosSegmentacion")
+                ),
+            "{missing}"
+        );
+
+        let null = wire(routine_definition_error(
+            &RoutineDefinitionError::DefinitionUnavailable {
+                schema: "dbo".to_owned(),
+                name: "Secret".to_owned(),
+            },
+        ));
+        assert_eq!(null["structuredContent"]["code"], DEFINITION_UNAVAILABLE);
+        let message = null["structuredContent"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(message.contains("dbo.Secret"), "{message}");
+        assert!(message.contains("NULL"), "{message}");
+        assert!(message.contains("VIEW DEFINITION"), "{message}");
+        assert!(
+            null["structuredContent"].get("mutation_outcome").is_none(),
+            "a read must not report a mutation outcome: {null}"
+        );
+    }
 }

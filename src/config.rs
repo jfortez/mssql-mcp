@@ -72,9 +72,10 @@ struct ConnectionOptions {
     database: Option<String>,
 
     /// SQL login, current Windows identity, or explicit NTLM credentials.
-    /// SQL/NTLM use MSSQL_USER and MSSQL_PASSWORD; NTLM also uses MSSQL_DOMAIN.
-    #[arg(long, env = "MSSQL_AUTH", value_enum, default_value = "sql")]
-    auth: AuthKind,
+    /// SQL/NTLM use MSSQL_USER and MSSQL_PASSWORD; a `DOMAIN\user` in
+    /// MSSQL_USER selects NTLM when this flag is absent.
+    #[arg(long, env = "MSSQL_AUTH", value_enum)]
+    auth: Option<AuthKind>,
 
     /// Operation deadline in seconds, including opening a connection.
     #[arg(long, env = "MSSQL_TIMEOUT_SECONDS", default_value_t = 15, value_parser = clap::value_parser!(u16).range(1..=300))]
@@ -195,34 +196,7 @@ impl ConnectionOptions {
         if database.trim().is_empty() {
             return Err("database must not be blank");
         }
-        let auth = match self.auth {
-            AuthKind::Sql => Auth::Sql {
-                user: required(
-                    "MSSQL_USER",
-                    "MSSQL_USER is required for SQL authentication",
-                )?,
-                password: required(
-                    "MSSQL_PASSWORD",
-                    "MSSQL_PASSWORD is required for SQL authentication",
-                )?,
-            },
-            AuthKind::Windows if cfg!(windows) => Auth::Windows,
-            AuthKind::Windows => return Err("Windows integrated authentication requires Windows"),
-            AuthKind::Ntlm => {
-                let domain = required("MSSQL_DOMAIN", "MSSQL_DOMAIN is required for NTLM")?;
-                let user = required("MSSQL_USER", "MSSQL_USER is required for NTLM")?;
-                if user.contains(['\\', '@']) || domain.contains(['\\', '@']) {
-                    return Err(
-                        "NTLM requires separate, unqualified MSSQL_DOMAIN and MSSQL_USER values",
-                    );
-                }
-                Auth::Ntlm {
-                    domain,
-                    user,
-                    password: required("MSSQL_PASSWORD", "MSSQL_PASSWORD is required for NTLM")?,
-                }
-            }
-        };
+        let auth = self.auth()?;
         Ok(Settings {
             host: host.to_owned(),
             port: self.port,
@@ -238,6 +212,78 @@ impl ConnectionOptions {
             check_config: false,
         })
     }
+
+    /// Resolve the SQL identity once, in the documented order: an explicit
+    /// `--auth` always wins, so the backslash in `MSSQL_USER` is a signal only
+    /// when the flag is absent and a contradictory pair is an error.
+    fn auth(&self) -> Result<Auth, &'static str> {
+        match self.auth {
+            Some(AuthKind::Windows) if cfg!(windows) => Ok(Auth::Windows),
+            Some(AuthKind::Windows) => Err("Windows integrated authentication requires Windows"),
+            Some(AuthKind::Sql) => sql_auth(),
+            Some(AuthKind::Ntlm) => ntlm_auth(),
+            None if user_is_qualified()? => ntlm_auth(),
+            None => sql_auth(),
+        }
+    }
+}
+
+const SQL_QUALIFIED_USER: &str = "SQL authentication cannot use a qualified MSSQL_USER: the DOMAIN\\user principal needs --auth ntlm";
+const NTLM_UNQUALIFIED_USER: &str =
+    "NTLM requires the domain in MSSQL_USER as DOMAIN\\user, not only the user name";
+const USER_WITH_EMPTY_PART: &str =
+    "MSSQL_USER must be DOMAIN\\user with a non-empty domain and user";
+
+/// Detection recognizes `DOMAIN\user` and nothing else: tiberius and sspi-rs
+/// take exactly that spelling, so a UPN would claim support the driver does not
+/// prove.
+fn user_is_qualified() -> Result<bool, &'static str> {
+    let user = required(
+        "MSSQL_USER",
+        "MSSQL_USER is required for SQL authentication",
+    )?;
+    Ok(user.contains('\\'))
+}
+
+fn sql_auth() -> Result<Auth, &'static str> {
+    let user = required(
+        "MSSQL_USER",
+        "MSSQL_USER is required for SQL authentication",
+    )?;
+    if user.contains('\\') {
+        return Err(SQL_QUALIFIED_USER);
+    }
+    Ok(Auth::Sql {
+        user,
+        password: required(
+            "MSSQL_PASSWORD",
+            "MSSQL_PASSWORD is required for SQL authentication",
+        )?,
+    })
+}
+
+fn ntlm_auth() -> Result<Auth, &'static str> {
+    let value = required("MSSQL_USER", "MSSQL_USER is required for NTLM")?;
+    let (domain, user) = qualified(&value)?.ok_or(NTLM_UNQUALIFIED_USER)?;
+    Ok(Auth::Ntlm {
+        domain: domain.to_owned(),
+        user: user.to_owned(),
+        password: required("MSSQL_PASSWORD", "MSSQL_PASSWORD is required for NTLM")?,
+    })
+}
+
+/// Split `MSSQL_USER` as `DOMAIN\user` on the first backslash.
+///
+/// `Ok(None)` means the value has no backslash at all. A backslash with an
+/// empty part on either side is an error: NTLM needs both halves.
+fn qualified(value: &str) -> Result<Option<(&str, &str)>, &'static str> {
+    let Some((domain, user)) = value.split_once('\\') else {
+        return Ok(None);
+    };
+    if domain.is_empty() || user.is_empty() {
+        return Err(USER_WITH_EMPTY_PART);
+    }
+    Ok(Some((domain, user)))
 }
 
 /// Accepted only from the environment.

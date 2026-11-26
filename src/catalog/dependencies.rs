@@ -14,8 +14,9 @@ use crate::statement::{Binder, Statement};
 
 use super::model::{CatalogError, ObjectIdentity, ObjectName, ObjectType};
 use super::sql::{
-    ALL_OBJECT_TYPES, PageQuery, Paging, execute_read, flag, number, object_type, optional_flag,
-    optional_number, optional_text, page_limit, parse_counts, required_text, validate_object,
+    ALL_OBJECT_TYPES, PageQuery, Paging, execute_read, flag, number, object_lookup_statement,
+    object_type, optional_flag, optional_number, optional_text, page_limit, parse_counts,
+    required_text, validate_object,
 };
 
 /// Input for `object_dependencies`.
@@ -48,24 +49,7 @@ impl ObjectDependencies {
     pub fn plan(&self) -> Result<ObjectDependenciesPlan, &'static str> {
         let (schema, name) = validate_object(&self.object)?;
         let limit = page_limit(self.limit)?;
-
-        let mut binder = Binder::default();
-        let schema_parameter = binder.bind(Value::String(schema))?;
-        let name_parameter = binder.bind(Value::String(name))?;
-        let resolve = Statement::read(
-            format!(
-                "SELECT CONVERT(nvarchar(20), o.object_id) AS [object_id], \
-                 CONVERT(nvarchar(128), s.name) AS [schema], \
-                 CONVERT(nvarchar(128), o.name) AS [name], \
-                 CONVERT(nvarchar(2), o.type) AS [type], \
-                 CONVERT(nvarchar(60), o.type_desc) AS [type_desc] \
-                 FROM sys.objects AS o JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
-                 WHERE o.is_ms_shipped = 0 AND s.name = {schema_parameter} \
-                   AND o.name = {name_parameter} AND o.type IN ({ALL_OBJECT_TYPES})"
-            ),
-            binder.parameters,
-            1,
-        );
+        let resolve = object_lookup_statement(ALL_OBJECT_TYPES, &schema, &name)?;
 
         let mut binder = Binder::default();
         let object_parameter = binder.bind(Value::from(0i32))?;
@@ -286,7 +270,7 @@ fn dependency_sql(direction: DependencyDirection, object_parameter: &str) -> Str
     )
 }
 
-fn resolve_object(read: &ReadOutput) -> Result<ObjectIdentity, CatalogError> {
+pub(super) fn resolve_object(read: &ReadOutput) -> Result<ObjectIdentity, CatalogError> {
     if read.columns.len() != 5 {
         return Err(CatalogError::UnexpectedResult);
     }

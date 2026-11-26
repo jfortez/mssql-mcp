@@ -6,6 +6,10 @@
 //!   columns, keys, foreign keys, indexes and routine parameters.
 //! * [`ObjectDependencies`] returns outgoing and incoming SQL-expression and
 //!   foreign-key edges for one object.
+//! * [`RoutineDefinition`] returns one `sys.sql_modules` definition, paged by
+//!   character so a body can be read end to end.
+//! * [`DependencyColumns`] returns the objects one module references together
+//!   with their columns, optionally filtered by a literal name fragment.
 //! * [`SearchObjects`] finds objects and columns by a literal name fragment.
 //! * [`TableStats`] returns approximate base-partition row/storage counters and
 //!   paged index sizes for one table.
@@ -26,8 +30,10 @@
 //! table scan.
 
 mod dependencies;
+mod dependency_columns;
 mod map;
 mod model;
+mod routine;
 mod search;
 mod sql;
 mod stats;
@@ -36,12 +42,19 @@ pub use dependencies::{
     DependencyDirection, DependencyEdge, DependencyObject, DependencyType, ObjectDependencies,
     ObjectDependenciesPage, ObjectDependenciesPlan,
 };
+pub use dependency_columns::{
+    DependencyColumnEntry, DependencyColumns, DependencyColumnsPage, DependencyColumnsPlan,
+    ReferencedColumnEntry, ReferencedObjectEntry,
+};
 pub use map::{SchemaMap, SchemaMapPage, SchemaMapPlan};
 pub use model::{
     CatalogEntry, CatalogError, ColumnEntry, DEFAULT_PAGE, ForeignKeyColumnEntry, ForeignKeyEntry,
     Include, IndexColumnEntry, IndexEntry, KeyColumnEntry, KeyEntry, KeyType, MAX_PAGE,
     ObjectEntry, ObjectIdentity, ObjectName, ObjectType, ParameterEntry, SchemaEntry,
     SearchInclude,
+};
+pub use routine::{
+    RoutineDefinition, RoutineDefinitionError, RoutineDefinitionPage, RoutineDefinitionPlan,
 };
 pub use search::{SearchColumn, SearchHit, SearchObject, SearchObjects, SearchPage, SearchPlan};
 pub use stats::{IndexSize, TableStats, TableStatsPlan, TableStatsResult};

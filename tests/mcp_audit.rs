@@ -15,6 +15,11 @@ const USER: &str = "audit-user";
 const PASSWORD: &str = "audit-marker-password-9f2c";
 const DOMAIN: &str = "AUDITDOMAIN";
 
+/// `DOMAIN\user`, the qualified form NTLM reads from `MSSQL_USER`.
+fn qualified_user() -> String {
+    format!("{DOMAIN}\\{USER}")
+}
+
 #[derive(Debug)]
 struct Audit {
     raw: String,
@@ -48,11 +53,15 @@ struct Server {
 impl Server {
     fn spawn(mode: &str, port: u16, auth: &str, trust: bool, yolo: bool) -> Self {
         let port = port.to_string();
+        let user = if auth == "ntlm" {
+            qualified_user()
+        } else {
+            USER.to_owned()
+        };
         let mut command = Command::new(env!("CARGO_BIN_EXE_mssql-mcp"));
         support::clear_env(&mut command)
-            .env("MSSQL_USER", USER)
+            .env("MSSQL_USER", user.as_str())
             .env("MSSQL_PASSWORD", PASSWORD)
-            .env("MSSQL_DOMAIN", DOMAIN)
             .args([
                 "--host",
                 "127.0.0.1",

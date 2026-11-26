@@ -18,10 +18,9 @@ Every setting is a command-line flag and an environment variable. Use the enviro
 | --- | --- | --- | --- |
 | `MSSQL_HOST` | `--host` | SQL Server hostname or IP | required |
 | `MSSQL_DATABASE` | `--database` | database name | required |
-| `MSSQL_AUTH` | `--auth` | `sql`, `windows`, `ntlm` | `sql` |
-| `MSSQL_USER` | — | login; not used by `windows` | required for `sql` and `ntlm` |
+| `MSSQL_AUTH` | `--auth` | `sql`, `windows`, `ntlm` | detected from `MSSQL_USER` |
+| `MSSQL_USER` | — | login, or `DOMAIN\user` for `ntlm`; not used by `windows` | required for `sql` and `ntlm` |
 | `MSSQL_PASSWORD` | — | login password; environment only | required for `sql` and `ntlm` |
-| `MSSQL_DOMAIN` | — | Windows domain, unqualified | required for `ntlm` |
 | `MSSQL_PORT` | `--port` | 1–65535; the instance's TCP port | `1433` |
 | `MSSQL_MODE` | `--mode` | `read`, `write`, `both` | `read` |
 | `MSSQL_MCP_YOLO` | `--yolo` | `true` skips the mutation approval prompt (dangerous) | `false` |
@@ -31,7 +30,7 @@ Every setting is a command-line flag and an environment variable. Use the enviro
 | `MSSQL_TIMEOUT_SECONDS` | `--timeout-seconds` | 1–300, per operation | `15` |
 | `MSSQL_TRUST_SERVER_CERTIFICATE` | `--trust-server-certificate` | `true` skips certificate checks (development only) | `false` |
 
-Authentication modes: `sql` uses `MSSQL_USER`/`MSSQL_PASSWORD`; `ntlm` uses those plus `MSSQL_DOMAIN`; `windows` uses the current Windows process identity, so it is unavailable on Linux and in the Docker image and does not use the two SQL credentials. No mode falls back to another identity.
+Authentication modes: `sql` uses the unqualified `MSSQL_USER` login and `MSSQL_PASSWORD`; `ntlm` uses a `DOMAIN\user` `MSSQL_USER` and `MSSQL_PASSWORD`; `windows` uses the current Windows process identity, so it is unavailable on Linux and in the Docker image and does not use the two SQL credentials. Without `--auth`, a backslash in `MSSQL_USER` selects `ntlm` and anything else selects `sql`; an explicit `--auth` always wins, and a combination that contradicts it, such as `--auth sql` with a qualified user, is rejected instead of guessed. No mode falls back to another identity.
 
 TLS is required and certificates are validated against the system store: use the hostname in the server certificate. `MSSQL_MODE=read` exposes the read tools in the table below; `write` exposes `insert_row`, `update_rows`, `delete_rows`, `query` and `explore_schema`; `both` exposes all 13. Updates and deletes need at least one filter and roll back when more than 100 rows would change. Every table mutation asks the client to confirm the target, columns and 100-row cap before connecting; `query` asks before every batch and shows the exact SQL. `--yolo` (or `MSSQL_MCP_YOLO=true`) skips those prompts and the audit trail records the bypass. Give the login only the SQL Server permissions it needs.
 
@@ -175,6 +174,8 @@ The Agent Client Protocol does not carry an MCP transport by itself. An ACP host
 | `explore_schema` | `schema?`, `include?`, `definition?` | `tree`, `truncated` |
 | `schema_map` | `schema?`, `include?`, `table?`, `offset?`, `limit?` | Paged `entries`: schemas, objects, columns, keys, indexes and routine parameters |
 | `object_dependencies` | `object`, `offset?`, `limit?` | Paged `edges` from SQL expressions and foreign keys, incoming and outgoing |
+| `routine_definition` | `object`, `offset?`, `limit?` | One `sys.sql_modules` definition, paged by character, with its total length |
+| `dependency_columns` | `object`, `column_hint?`, `offset?`, `limit?` | Paged referenced objects and their columns, optionally filtered by a literal column-name fragment |
 | `search_objects` | `query`, `schema?`, `include?`, `offset?`, `limit?` | Paged `hits` by literal name fragment; `include` accepts `objects` or `columns` |
 | `table_stats` | `table`, `offset?`, `limit?` | Approximate row count and base storage, plus index sizes paged by `next_index_offset` |
 | `sample_rows` | `table`, `limit?` | Up to 25 rows, default 5, using the first 64 columns in catalog order |
@@ -190,6 +191,10 @@ The Agent Client Protocol does not carry an MCP transport by itself. An ACP host
 `explore_schema` is read-only and available in every mode. It returns one indented `tree` string: schemas; under each, tables with column count and primary key, columns with type and nullability, outgoing and incoming foreign-key relations, views, procedures with parameter signatures and definition size, and functions with return type and parameter signatures. `schema` narrows the tree, `include` selects `tables`, `views`, `procedures` and `functions` (all four by default), and `definition: true` inlines procedure and function bodies from `sys.sql_modules`. Foreign-key edges identify the constraint and pair the child and referenced columns in constraint order. Catalog queries and the tree itself are bounded: per-table column cuts and per-routine definition cuts say how much was omitted. Any cut sets `truncated` and ends the tree with a visible `… truncated` line.
 
 `schema_map` returns separate records for each object and its children with stable IDs. Follow `next_offset` until it is `null`; it is independent of `truncated`, which flags clipped default, computed, or index-filter expressions. Foreign keys include both named endpoints and separate ordered column pairs. The `include` filter accepts `tables`, `views`, `procedures`, and `functions`. Table counts are approximate partition metadata, not `COUNT(*)` scans. `object_dependencies` also reports SQL-expression references that SQL Server cannot resolve locally.
+
+`routine_definition` reads one procedure, function, view or trigger from `sys.sql_modules` and returns its full definition paged by character. `offset` and `limit` count UTF-16 units, the same unit as the per-cell cap used elsewhere; `limit` defaults to 8,000 and is capped at 20,000. `definition_length` is the total body length, `next_offset` is the next character to read, and `truncated` means more of the body remains. Follow `next_offset` until it is `null` and concatenate the pages to reproduce the stored definition exactly. A NULL definition is reported as `definition_unavailable`, not as an empty body. These reads depend on `VIEW DEFINITION`: without it, `sys.sql_modules` returns no definition and `sys.sql_expression_dependencies` hides the rows, so the same object can look empty to that login.
+
+`dependency_columns` resolves the objects one procedure, function, view or trigger references through `sys.sql_expression_dependencies` and lists their columns. `column_hint` is a literal name fragment matched with `CHARINDEX`; an empty or omitted hint returns every column. Every referenced object appears as an `object` entry, even when the hint matches none of its columns: its `matching_column_count` is `0` and it contributes no `column` entries. An object that does not appear in the feed at all was not referenced. Unresolved or cross-database references still appear as object entries with a null `object_id`, but have no readable columns. Follow `next_offset` until it is `null` to see every referenced object and column.
 
 ## Export a schema map without MCP
 
@@ -222,6 +227,7 @@ Tool errors keep `isError`, a human-readable `content[0].text` and a `structured
 | `invalid_arguments` | arguments do not match the tool schema | `not_attempted` |
 | `invalid_input` | a validated field was rejected | `not_attempted` |
 | `object_not_found` | a requested catalog object is missing or not visible | omitted |
+| `definition_unavailable` | `sys.sql_modules.definition` is NULL, or the login lacks `VIEW DEFINITION` | omitted |
 | `approval_denied` | the human declined or cancelled, or the approval prompt timed out | `not_attempted` |
 | `approval_unavailable` | the client cannot show an approval prompt, or asking it failed | `not_attempted` |
 | `database_busy` | four operations already active | `not_attempted` |
@@ -243,4 +249,8 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 Start with `explore_schema` before any query: it returns the schemas, tables, columns, keys, relations and routine signatures in one indented tree, so an agent can see where data lives without guessing. Narrow it with `schema`, or add `definition: true` to read procedure and function bodies.
 
-A reliable order for a new database is `explore_schema` → `describe_table` → `sample_rows` or a sorted `select_rows`. Use `search_objects` if you know part of a name, `object_dependencies` for impact analysis, and `schema_map` when you need to page through the whole catalog. Reach for `query` only when the structured tools cannot express the operation and the human has approved it or deliberately enabled `--yolo`.
+A reliable order for a new database is `explore_schema` → `describe_table` → `sample_rows` or a sorted `select_rows`. Use `search_objects` if you know part of a name, `object_dependencies` for impact analysis, and `schema_map` when you need to page through the whole catalog.
+
+To audit one routine, read its body with `routine_definition` and follow `next_offset` until it is `null`. Use `object_dependencies` for the edge list, then `dependency_columns` with a hint such as `CreadoEn` to find which referenced table carries that column without calling another tool. Once the table is known, `describe_table` or `select_rows` confirms the data. Remember that a login without `VIEW DEFINITION` sees none of these definitions or dependency rows.
+
+Reach for `query` only when the structured tools cannot express the operation and the human has approved it or deliberately enabled `--yolo`.
