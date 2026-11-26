@@ -13,7 +13,7 @@ use rmcp::transport::async_rw::AsyncRwTransport;
 use serde_json::{Value, json};
 
 use crate::audit::{self, Scope, Status};
-use crate::config::{Mode, Settings};
+use crate::config::{Mode, Settings, Transport};
 use crate::database::{Database, DbError, Outcome};
 use crate::statement::{
     DeleteRows, DescribeTable, InsertRow, ListTables, SelectRows, Statement, Table, UpdateRows,
@@ -482,13 +482,16 @@ impl ServerHandler for McpServer {
     }
 }
 
-pub async fn serve(settings: Settings) -> Result<(), &'static str> {
+pub async fn serve(settings: Settings) -> Result<(), String> {
     audit::startup(
         settings.mode,
         settings.auth.name(),
         !settings.trust_server_certificate,
     );
-    let result = run(settings).await;
+    let result = match settings.transport {
+        Transport::Stdio => run_stdio(settings).await,
+        Transport::Http => crate::http::run(settings).await,
+    };
     audit::shutdown(if result.is_ok() {
         Status::Ok
     } else {
@@ -497,19 +500,19 @@ pub async fn serve(settings: Settings) -> Result<(), &'static str> {
     result
 }
 
-async fn run(settings: Settings) -> Result<(), &'static str> {
-    let server = McpServer::new(settings)?;
+async fn run_stdio(settings: Settings) -> Result<(), String> {
+    let server = McpServer::new(settings).map_err(str::to_owned)?;
     let (reader, writer) = rmcp::transport::stdio();
     let transport = AsyncRwTransport::<RoleServer, _, _>::new_server(reader, writer)
         .with_max_line_length(MAX_FRAME_BYTES);
     let running = match rmcp::serve_server(server, transport).await {
         Ok(running) => running,
         Err(ServerInitializeError::ConnectionClosed(_)) => return Ok(()),
-        Err(_) => return Err("MCP initialization failed"),
+        Err(_) => return Err("MCP initialization failed".to_owned()),
     };
     match running.waiting().await {
         Ok(_) => Ok(()),
-        Err(_) => Err("MCP service stopped unexpectedly"),
+        Err(_) => Err("MCP service stopped unexpectedly".to_owned()),
     }
 }
 

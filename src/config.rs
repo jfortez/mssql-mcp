@@ -1,4 +1,5 @@
 use std::env;
+use std::net::SocketAddr;
 
 use clap::{Parser, ValueEnum};
 
@@ -17,6 +18,12 @@ impl Mode {
             Self::Both => "both",
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Transport {
+    Stdio,
+    Http,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -73,6 +80,15 @@ pub struct Cli {
     #[arg(long, env = "MSSQL_MODE", value_enum, default_value = "read")]
     mode: Mode,
 
+    /// Serve over stdio (default) or as one shared Streamable HTTP daemon.
+    /// The HTTP transport requires MSSQL_MCP_TOKEN in the environment.
+    #[arg(long, env = "MSSQL_MCP_TRANSPORT", value_enum, default_value = "stdio")]
+    transport: Transport,
+
+    /// TCP address the HTTP transport binds once; compatible clients share it.
+    #[arg(long, env = "MSSQL_MCP_HTTP_LISTEN", default_value = "127.0.0.1:8765")]
+    http_listen: SocketAddr,
+
     /// Operation deadline in seconds, including opening a connection.
     #[arg(long, env = "MSSQL_TIMEOUT_SECONDS", default_value_t = 15, value_parser = clap::value_parser!(u16).range(1..=300))]
     timeout_seconds: u16,
@@ -92,6 +108,10 @@ pub struct Settings {
     pub database: String,
     pub auth: Auth,
     pub mode: Mode,
+    pub transport: Transport,
+    pub http_listen: SocketAddr,
+    /// Bearer token guarding the HTTP transport; always `None` for stdio.
+    pub token: Option<String>,
     pub timeout_seconds: u16,
     pub trust_server_certificate: bool,
     pub check_config: bool,
@@ -139,11 +159,33 @@ impl Cli {
             database: self.database,
             auth,
             mode: self.mode,
+            transport: self.transport,
+            http_listen: self.http_listen,
+            token: match self.transport {
+                Transport::Stdio => None,
+                Transport::Http => Some(http_token()?),
+            },
             timeout_seconds: self.timeout_seconds,
             trust_server_certificate: self.trust_server_certificate,
             check_config: self.check_config,
         })
     }
+}
+
+/// Bearer token for the HTTP transport; it is only accepted from the environment.
+fn http_token() -> Result<String, &'static str> {
+    let token = required(
+        "MSSQL_MCP_TOKEN",
+        "MSSQL_MCP_TOKEN is required for the HTTP transport",
+    )?;
+    if !(32..=128).contains(&token.len())
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err("MSSQL_MCP_TOKEN must be 32 to 128 characters of A-Z, a-z, 0-9, '_' or '-'");
+    }
+    Ok(token)
 }
 
 fn required(name: &str, message: &'static str) -> Result<String, &'static str> {

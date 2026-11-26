@@ -2,14 +2,28 @@
 
 Native stdio MCP server for Microsoft SQL Server. The Rust binary connects over TDS without ODBC or `sqlcmd`. It starts in read mode and connects to SQL Server only when a tool needs it.
 
-## Install locally
+## Install
+
+You need Rust 1.88 or newer on the installation host.
+
+### From crates.io (after publication)
+
+```sh
+cargo install mssql-mcp --version 0.1.0 --locked
+```
+
+Version 0.1.0 is not published yet. Until then, install from a local checkout.
+
+### From a local checkout
+
+From the repository root:
 
 ```sh
 cargo install --path . --locked
-mssql-mcp --help
+mssql-mcp --version
 ```
 
-The crate is not yet published on crates.io.
+Cargo installs the executable in its `bin` directory (`~/.cargo/bin` by default). If your MCP client cannot find it, use the full path to `mssql-mcp` (`mssql-mcp.exe` on Windows). To build without installing, use `cargo build --release --locked`; the binary is under `target/release/`.
 
 ## Connect an MCP client
 
