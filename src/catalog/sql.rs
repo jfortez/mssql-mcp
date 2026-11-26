@@ -14,6 +14,36 @@ use super::model::{CatalogError, DEFAULT_PAGE, MAX_PAGE, ObjectName, ObjectType}
 pub(super) const ALL_OBJECT_TYPES: &str =
     "N'U', N'V', N'P', N'PC', N'FN', N'IF', N'TF', N'FS', N'FT', N'AF'";
 
+/// Object classes that can own a `sys.sql_modules` definition.
+pub(super) const MODULE_OBJECT_TYPES: &str =
+    "N'V', N'P', N'PC', N'FN', N'IF', N'TF', N'FS', N'FT', N'AF', N'TR'";
+
+/// The shared object-resolution statement used by the dependency tools. It
+/// returns at most one identity row and binds both caller names.
+pub(super) fn object_lookup_statement(
+    types: &str,
+    schema: &str,
+    name: &str,
+) -> Result<Statement, &'static str> {
+    let mut binder = Binder::default();
+    let schema_parameter = binder.bind(Value::String(schema.to_owned()))?;
+    let name_parameter = binder.bind(Value::String(name.to_owned()))?;
+    Ok(Statement::read(
+        format!(
+            "SELECT CONVERT(nvarchar(20), o.object_id) AS [object_id], \
+             CONVERT(nvarchar(128), s.name) AS [schema], \
+             CONVERT(nvarchar(128), o.name) AS [name], \
+             CONVERT(nvarchar(2), o.type) AS [type], \
+             CONVERT(nvarchar(60), o.type_desc) AS [type_desc] \
+             FROM sys.objects AS o JOIN sys.schemas AS s ON s.schema_id = o.schema_id \
+             WHERE o.is_ms_shipped = 0 AND s.name = {schema_parameter} \
+               AND o.name = {name_parameter} AND o.type IN ({types})"
+        ),
+        binder.parameters,
+        1,
+    ))
+}
+
 /// A page query whose base SQL already ends with `ORDER BY`. Offset and limit
 /// are appended as two extra bound parameters so no caller input becomes SQL.
 #[derive(Clone, Debug)]

@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 
 use crate::approval::{self, Approves, Decision, Subject};
 use crate::audit::{self, Scope, Status};
-use crate::catalog::{ObjectDependencies, SchemaMap, SearchObjects, TableStats};
+use crate::catalog::{
+    DependencyColumns, ObjectDependencies, RoutineDefinition, SchemaMap, SearchObjects, TableStats,
+};
 use crate::config::{Mode, Settings, Transport};
 use crate::database::{Database, DbError, Outcome, SqlError};
 use crate::query::Query;
@@ -34,6 +36,7 @@ const MODE_UNAVAILABLE: &str = "mode_unavailable";
 const INVALID_ARGUMENTS: &str = "invalid_arguments";
 const INVALID_INPUT: &str = "invalid_input";
 const OBJECT_NOT_FOUND: &str = "object_not_found";
+const DEFINITION_UNAVAILABLE: &str = "definition_unavailable";
 const UNKNOWN_TOOL: &str = "unknown_tool";
 const DATABASE_BUSY: &str = "database_busy";
 const CONNECTION_FAILED: &str = "connection_failed";
@@ -79,7 +82,8 @@ const INSTRUCTIONS: &str = concat!(
     "read and receives approval_unavailable for those tools. Start the server with --yolo (or ",
     "MSSQL_MCP_YOLO=true) only when the operator has chosen to bypass that prompt. Read mode exposes ",
     "only read tools: list_tables, describe_table, select_rows, explore_schema, schema_map, ",
-    "object_dependencies, search_objects, table_stats and sample_rows."
+    "object_dependencies, routine_definition, dependency_columns, search_objects, table_stats ",
+    "and sample_rows."
 );
 
 #[derive(Clone, Copy)]
@@ -94,12 +98,14 @@ enum Known {
     ExploreSchema,
     SchemaMap,
     ObjectDependencies,
+    RoutineDefinition,
+    DependencyColumns,
     SearchObjects,
     TableStats,
     SampleRows,
 }
 
-const KNOWN: [Known; 13] = [
+const KNOWN: [Known; 15] = [
     Known::ListTables,
     Known::DescribeTable,
     Known::SelectRows,
@@ -110,6 +116,8 @@ const KNOWN: [Known; 13] = [
     Known::ExploreSchema,
     Known::SchemaMap,
     Known::ObjectDependencies,
+    Known::RoutineDefinition,
+    Known::DependencyColumns,
     Known::SearchObjects,
     Known::TableStats,
     Known::SampleRows,
@@ -128,6 +136,8 @@ impl Known {
             Self::ExploreSchema => "explore_schema",
             Self::SchemaMap => "schema_map",
             Self::ObjectDependencies => "object_dependencies",
+            Self::RoutineDefinition => "routine_definition",
+            Self::DependencyColumns => "dependency_columns",
             Self::SearchObjects => "search_objects",
             Self::TableStats => "table_stats",
             Self::SampleRows => "sample_rows",
@@ -152,6 +162,8 @@ impl Known {
                     | Self::ExploreSchema
                     | Self::SchemaMap
                     | Self::ObjectDependencies
+                    | Self::RoutineDefinition
+                    | Self::DependencyColumns
                     | Self::SearchObjects
                     | Self::TableStats
                     | Self::SampleRows
@@ -270,6 +282,28 @@ impl ToolError {
             code: OBJECT_NOT_FOUND,
             message: "database object not found or not visible to the configured login".to_owned(),
             action: "check the object name, schema, and login permissions",
+            retryable: false,
+            mutation_outcome: None,
+            sql_error: None,
+        }
+    }
+
+    fn object_not_found(message: String) -> Self {
+        Self {
+            code: OBJECT_NOT_FOUND,
+            message,
+            action: "check the object name, schema, and login permissions",
+            retryable: false,
+            mutation_outcome: None,
+            sql_error: None,
+        }
+    }
+
+    fn definition_unavailable(message: String) -> Self {
+        Self {
+            code: DEFINITION_UNAVAILABLE,
+            message,
+            action: "grant VIEW DEFINITION on the database, or check whether the module is encrypted",
             retryable: false,
             mutation_outcome: None,
             sql_error: None,
@@ -909,6 +943,17 @@ impl ServerHandler for McpServer {
                 )
                 .await
             }
+            Known::RoutineDefinition => self.routine_definition_call(arguments, started).await,
+            Known::DependencyColumns => {
+                self.catalog_call(
+                    tool,
+                    arguments,
+                    started,
+                    DependencyColumns::plan,
+                    |plan| async move { plan.execute(&self.database).await },
+                )
+                .await
+            }
             Known::SearchObjects => {
                 self.catalog_call(
                     tool,
@@ -1041,6 +1086,8 @@ fn build_tools() -> Result<Vec<Tool>, &'static str> {
         .with_annotations(read()),
         Tool::new(Known::SchemaMap.name(), "Page through a machine-readable catalog of schemas, objects, columns, keys, indexes and routine signatures.", schema_for_input::<SchemaMap>().map_err(|_| "tool schema generation failed")?).with_annotations(read()),
         Tool::new(Known::ObjectDependencies.name(), "Page through incoming and outgoing SQL-expression and foreign-key dependencies.", schema_for_input::<ObjectDependencies>().map_err(|_| "tool schema generation failed")?).with_annotations(read()),
+        Tool::new(Known::RoutineDefinition.name(), "Return one procedure, function, view or trigger definition from sys.sql_modules, paged by character with the total length.", schema_for_input::<RoutineDefinition>().map_err(|_| "tool schema generation failed")?).with_annotations(read()),
+        Tool::new(Known::DependencyColumns.name(), "List the objects one module references and their columns. Every referenced object gets an object entry even when column_hint matches none of its columns, and matching_column_count is 0 for that object; an object missing from the feed was not referenced.", schema_for_input::<DependencyColumns>().map_err(|_| "tool schema generation failed")?).with_annotations(read()),
         Tool::new(Known::SearchObjects.name(), "Find objects and columns by a literal name fragment.", schema_for_input::<SearchObjects>().map_err(|_| "tool schema generation failed")?).with_annotations(read()),
         Tool::new(Known::TableStats.name(), "Return approximate partition row counts and paged index storage sizes without a table scan.", schema_for_input::<TableStats>().map_err(|_| "tool schema generation failed")?).with_annotations(read()),
         Tool::new(Known::SampleRows.name(), "Sample up to 25 rows using the first 64 columns in catalog order.", schema_for_input::<SampleRows>().map_err(|_| "tool schema generation failed")?).with_annotations(read()),
