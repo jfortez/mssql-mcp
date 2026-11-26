@@ -175,6 +175,45 @@ class Mcp:
         assert not result.get("isError", False), result
         return result["structuredContent"]
 
+    def question(self, name, arguments):
+        """Ask for one mutation and return the relay question.
+
+        The harness has no interactive human, so the answers below are simulated
+        on the human's behalf. What the server must never do is run anything
+        before that answer exists, and every helper here asserts the question
+        arrived first with nothing executed.
+        """
+        result = self.tool(name, arguments)
+        assert result["code"] == "approval_required", result
+        assert result["mutation_outcome"] == "not_attempted", result
+        assert result["row_cap"] in (None, 100), result
+        assert result["expires_in_seconds"] > 0, result
+        assert result["approval_token_id"] == result["approval_token"][:8], result
+        return result
+
+    def relay(self, name, arguments, decision, *, token=None):
+        """Repeat a mutation call with the relayed answer.
+
+        Without `token` the question is asked first, which is the simulated
+        human handing the answer back. A known token is passed explicitly to
+        exercise a swap or a replay.
+        """
+        if token is None:
+            token = self.question(name, arguments)["approval_token"]
+        reply = self.send("tools/call", {"name": name, "arguments": {
+            **arguments, "approval_token": token, "approval_decision": decision}})
+        return reply["result"]
+
+    def approve(self, name, arguments, *, token=None):
+        result = self.relay(name, arguments, "grant", token=token)
+        assert not result.get("isError", False), result
+        return result["structuredContent"]
+
+    def deny(self, name, arguments, *, token=None):
+        result = self.relay(name, arguments, "deny", token=token)
+        assert result.get("isError") is True, result
+        return result["structuredContent"]
+
 
 @contextlib.contextmanager
 def server(binary, host, port, user, password, mode, *, trust, yolo=False, database="McpFixture"):
@@ -262,19 +301,29 @@ def verify(binary, host, port, reader, writer):
     with server(binary, host, port, "mcp_writer", writer, "write", trust=True) as client:
         instructions = client.initialize.get("instructions", "")
         assert "elicitation" in instructions and "--yolo" in instructions, instructions
-        refused = client.tool(
-            "insert_row",
-            {"table": table, "values": {"id": 1002, "label": "refused", "group_id": 2}},
-            error=True,
-        )
-        detail = refused["result"]["structuredContent"]
-        assert detail["code"] == "approval_unavailable", detail
-        assert detail["mutation_outcome"] == "not_attempted", detail
-        assert detail["retryable"] is False, detail
-        assert "elicitation" in detail["message"] and "--yolo" in detail["message"], detail
-    refusal = next(record for record in audit_calls(client) if record["tool"] == "insert_row")
-    assert (refusal["code"], refusal["approval"]) == ("approval_unavailable", "unavailable"), refusal
-    print("PASS: a mutation without approval and without --yolo is refused before connecting")
+        refused_row = {"table": table, "values": {"id": 1002, "label": "refused", "group_id": 2}}
+        question = client.question("insert_row", refused_row)
+        assert question["row_cap"] == 100, question
+        assert "insert_row" in question["approval_message"], question
+        # Simulated on the human's behalf: a client without elicitation relays
+        # the question, and this answer denies it.
+        refused = client.deny("insert_row", refused_row, token=question["approval_token"])
+        assert refused["code"] == "approval_denied", refused
+        assert refused["mutation_outcome"] == "not_attempted", refused
+        assert refused["retryable"] is False, refused
+        replay = client.relay("insert_row", refused_row, "grant", token=question["approval_token"])
+        assert replay["structuredContent"]["code"] == "approval_token_reused", replay
+    asked, denial, replayed = [
+        record for record in audit_calls(client) if record["tool"] == "insert_row"
+    ]
+    assert (asked["approval"], asked["status"]) == ("required", "ok"), asked
+    assert asked["approval_token_id"] == question["approval_token_id"], asked
+    assert (denial["code"], denial["approval"]) == ("approval_denied", "denied"), denial
+    assert denial["approval_token_id"] == asked["approval_token_id"], denial
+    assert replayed["code"] == "approval_token_reused", replayed
+    assert "approval_token" not in denial, denial
+    assert "approval_token" not in replayed, replayed
+    print("PASS: a mutation without elicitation asks first and runs only on an answer")
 
     with server(binary, host, port, "mcp_writer", writer, "write", trust=True, yolo=True) as client:
         client.tool("select_rows", query, error=True)
@@ -288,6 +337,7 @@ def verify(binary, host, port, reader, writer):
     with server(binary, host, port, "mcp_writer", writer, "both", trust=True, yolo=True) as client:
         inserted_query = {**query, "filters": {"id": 1001}}
         assert client.tool("select_rows", inserted_query)["rows"] == [["1001", "O'Brien"]]
+        assert client.tool("select_rows", {**query, "filters": {"id": 1002}})["rows"] == [], "the denied row exists"
         edit = {"table": table, "values": {"label": None}, "filters": {"id": 1001}}
         assert client.tool("update_rows", edit)["affected_rows"] == 1
         assert client.tool("select_rows", inserted_query)["rows"] == [["1001", None]]
@@ -338,12 +388,36 @@ def verify(binary, host, port, reader, writer):
     print("PASS: query creates, alters and drops a stored procedure under approval bypass")
 
     with server(binary, host, port, "mcp_writer", writer, "both", trust=True) as client:
+        doomed = {"table": {"schema": "probe", "name": "Doomed"}, "columns": ["id"], "order_by": ["id"]}
         for statement in ("DROP TABLE probe.Doomed", "DELETE FROM probe.Doomed", "TRUNCATE TABLE probe.Doomed"):
-            refused = client.tool("query", {"sql": statement}, error=True)["result"]["structuredContent"]
-            assert refused["code"] == "approval_unavailable", (statement, refused)
+            question = client.question("query", {"sql": statement})
+            assert question["row_cap"] is None, (statement, question)
+            assert statement in question["approval_message"], (statement, question)
+            # Simulated on the human's behalf: the question is denied, so the
+            # destructive batch must never reach SQL Server.
+            refused = client.deny("query", {"sql": statement}, token=question["approval_token"])
+            assert refused["code"] == "approval_denied", (statement, refused)
             assert refused["mutation_outcome"] == "not_attempted", (statement, refused)
-        assert client.tool("select_rows", {"table": {"schema": "probe", "name": "Doomed"}, "columns": ["id"], "order_by": ["id"]})["rows"] == [["1"], ["2"], ["3"]]
-    print("PASS: destructive SQL without approval is refused and leaves the table untouched")
+        assert client.tool("select_rows", doomed)["rows"] == [["1"], ["2"], ["3"]], "a denied batch changed the table"
+
+        # A grant executes exactly the answered bytes, once.
+        inserted = {"table": table, "values": {"id": 1003, "label": "relayed", "group_id": 2}}
+        question = client.question("insert_row", inserted)
+        swapped = client.relay(
+            "insert_row",
+            {"table": table, "values": {"id": 1004, "label": "relayed", "group_id": 2}},
+            "grant",
+            token=question["approval_token"],
+        )
+        assert swapped["structuredContent"]["code"] == "approval_token_mismatch", swapped
+        assert client.approve("insert_row", inserted, token=question["approval_token"]) == {"affected_rows": 1}
+        replay = client.relay("insert_row", inserted, "grant", token=question["approval_token"])
+        assert replay["structuredContent"]["code"] == "approval_token_reused", replay
+        assert client.tool("select_rows", {**query, "filters": {"id": 1003}})["rows"] == [["1003", "relayed"]]
+        assert client.tool("select_rows", {**query, "filters": {"id": 1004}})["rows"] == []
+        assert client.approve("delete_rows", {"table": table, "filters": {"id": 1003}}) == {"affected_rows": 1}
+        assert client.tool("select_rows", {**query, "filters": {"id": 1003}})["rows"] == []
+    print("PASS: destructive SQL and mutations run only on the answered bytes; denials leave the data untouched")
 
     with server(binary, host, port, "mcp_reader", reader, "read", trust=True) as client:
         for statement in ("DROP TABLE dbo.Doomed", "DELETE FROM dbo.Doomed"):
@@ -366,12 +440,19 @@ def verify(binary, host, port, reader, writer):
             assert "sql" not in audit and "DROP" not in str(audit).upper(), audit
 
     with server(binary, host, port, "mcp_writer", writer, "write", trust=True) as client:
-        refused_query = client.tool("query", {"sql": "SELECT 1 AS n"}, error=True)
-        detail = refused_query["result"]["structuredContent"]
-        assert detail["code"] == "approval_unavailable" and detail["mutation_outcome"] == "not_attempted", detail
-    query_audit = next(record for record in audit_calls(client) if record["tool"] == "query")
-    assert "sql" not in query_audit and "SELECT 1" not in str(query_audit), query_audit
-    print("PASS: query is refused without approval and its text stays out of the audit record")
+        sql = "SELECT 1 AS n"
+        question = client.question("query", {"sql": sql})
+        assert question["row_cap"] is None, question
+        assert question["approval_message"].endswith(sql), question
+        refused = client.deny("query", {"sql": sql}, token=question["approval_token"])
+        assert refused["code"] == "approval_denied", refused
+        assert refused["mutation_outcome"] == "not_attempted", refused
+    query_records = [record for record in audit_calls(client) if record["tool"] == "query"]
+    assert [record["approval"] for record in query_records] == ["required", "denied"], query_records
+    for record in query_records:
+        assert "sql" not in record and "SELECT 1" not in str(record), record
+        assert "approval_token" not in record, record
+    print("PASS: query asks before it runs and its text stays out of the audit record")
     print("PASS: write/both, INSERT/UPDATE/DELETE, NULL, sorted paging, audited rollback and value redaction")
 
     with server(binary, host, port, "mcp_writer", writer, "both", trust=True, yolo=True) as client:

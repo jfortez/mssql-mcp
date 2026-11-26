@@ -1,0 +1,96 @@
+name: Release
+
+# Manual only: a merge must never cut a release by itself.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Verify the package without publishing to crates.io
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Require the registry token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not configured. Add it under Settings > Secrets and variables > Actions, then rerun this workflow."
+            exit 1
+          fi
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+
+      - name: Check formatting
+        run: cargo +stable fmt --all --check
+
+      - name: Run tests
+        run: cargo +stable test --locked
+
+      - name: Run Clippy
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+
+      - name: Read the manifest version
+        id: version
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not read the version from Cargo.toml."
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION"
+
+      - name: Refuse an existing tag
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag v$VERSION already exists; bump the version in Cargo.toml before releasing."
+            exit 1
+          fi
+
+      - name: Verify the package
+        run: cargo +stable package --locked
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            cargo +stable publish --locked --dry-run
+          else
+            cargo +stable publish --locked
+          fi
+
+      - name: Tag and create the GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push origin "v$VERSION"
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --generate-notes

@@ -388,6 +388,36 @@ fn tools_expose_object_input_schemas() {
         64
     );
 
+    // Every mutation tool advertises the optional relay pair, spelled exactly
+    // `approval_token` and `approval_decision`, so a client without elicitation
+    // can find the answer arguments in the schema it already reads.
+    for name in ["insert_row", "update_rows", "delete_rows", "query"] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} present"));
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} required list"));
+        for optional in ["approval_token", "approval_decision"] {
+            assert!(
+                !required.contains(&json!(optional)),
+                "{name}.{optional} must stay optional: {tool}"
+            );
+            assert!(
+                tool["inputSchema"]["properties"][optional].is_object(),
+                "{name} must describe {optional}: {tool}"
+            );
+        }
+        let decision = tool["inputSchema"]["properties"]["approval_decision"].to_string();
+        for value in ["grant", "deny"] {
+            assert!(
+                decision.contains(value),
+                "{name}.approval_decision must accept {value:?}: {decision}"
+            );
+        }
+    }
+
     // Annotations describe the tool list: reads are read-only and
     // idempotent, insert is additive, update/delete are destructive, and query
     // may change anything the configured login can reach.

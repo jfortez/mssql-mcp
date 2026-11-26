@@ -319,51 +319,102 @@ fn mode_gates_apply_to_the_http_transport() {
 }
 
 #[test]
-fn mutations_need_approval_over_http_and_fail_closed() {
+fn mutations_need_a_relayed_answer_over_http_and_never_run_without_one() {
     let daemon = Daemon::start("write");
+    let arguments = json!({"table": {"name": "Items"}, "values": {"id": 1}});
     let started = Instant::now();
     let response = send(
         daemon.addr,
-        authorized(tools_call_with(
-            2,
-            "insert_row",
-            json!({"table": {"name": "Items"}, "values": {"id": 1}}),
-        )),
+        authorized(tools_call_with(2, "insert_row", arguments.clone())),
     );
     assert_eq!(response.status, 200, "{}", response.text());
     let result = response.json()["result"].clone();
-    let error = &result["structuredContent"];
-    assert_eq!(result["isError"], true, "{result}");
-    assert_eq!(error["code"], "approval_unavailable", "{result}");
-    assert_eq!(error["mutation_outcome"], "not_attempted", "{result}");
-    assert_eq!(error["retryable"], false, "{result}");
+    assert_eq!(
+        result["isError"], false,
+        "the question is not an error: {result}"
+    );
+    let question = &result["structuredContent"];
+    assert_eq!(question["code"], "approval_required", "{result}");
+    assert_eq!(question["mutation_outcome"], "not_attempted", "{result}");
+    assert_eq!(question["row_cap"], 100, "{result}");
+    assert_eq!(question["expires_in_seconds"], 120, "{result}");
+    let token = question["approval_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("question without a token: {result}"))
+        .to_owned();
+    let token_id = question["approval_token_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("question without a token label: {result}"));
+    assert_eq!(token_id, &token[..8]);
+    let action = question["action"]
+        .as_str()
+        .unwrap_or_else(|| panic!("question without an action: {result}"));
     assert!(
-        result["content"][0]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("--yolo") && text.contains("elicitation")),
-        "the refusal must name both remedies: {result}"
+        action.contains("approval_token") && action.contains("approval_decision"),
+        "the action must tell the client how to answer: {action}"
     );
     assert!(
         started.elapsed() < Duration::from_secs(10),
-        "a stateless HTTP transport cannot elicit, so the gate must fail closed without waiting for the 120 s timeout"
+        "a transported client cannot elicit, so the gate must ask instead of waiting for the 120 s prompt timeout"
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline
-        && !daemon
-            .stderr_text()
-            .contains("\"approval\":\"unavailable\"")
-    {
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_tool_calls(&daemon, 1);
+    let stderr = daemon.stderr_text();
+    assert!(
+        stderr.contains("\"approval\":\"required\""),
+        "the question must be audited: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("\"approval_token_id\":\"{token_id}\"")),
+        "the audit record must carry the token label: {stderr}"
+    );
+
+    // The retry is the only call that may reach SQL Server. The daemon's
+    // database port is closed, so an executed statement fails at the connection.
+    let mut granted = arguments;
+    granted["approval_token"] = json!(token);
+    granted["approval_decision"] = json!("grant");
+    let response = send(
+        daemon.addr,
+        authorized(tools_call_with(3, "insert_row", granted.clone())),
+    );
+    assert_eq!(response.status, 200, "{}", response.text());
+    let result = response.json()["result"].clone();
+    assert_eq!(result["isError"], true, "{result}");
+    assert_eq!(
+        result["structuredContent"]["code"], "connection_failed",
+        "a granted retry must reach the database layer: {result}"
+    );
+    assert_eq!(
+        result["structuredContent"]["mutation_outcome"],
+        "not_attempted"
+    );
+
+    // One token, one execution: the replay is refused as reuse.
+    let response = send(
+        daemon.addr,
+        authorized(tools_call_with(4, "insert_row", granted)),
+    );
+    let result = response.json()["result"].clone();
+    assert_eq!(result["isError"], true, "{result}");
+    assert_eq!(
+        result["structuredContent"]["code"], "approval_token_reused",
+        "{result}"
+    );
+
+    wait_for_tool_calls(&daemon, 3);
     let stderr = daemon.stderr_text();
     assert_eq!(
         stderr.matches("\"event\":\"tool_call\"").count(),
-        1,
-        "the refused mutation must still be audited: {stderr}"
+        3,
+        "every relayed call must be audited: {stderr}"
     );
     assert!(
-        stderr.contains("\"approval\":\"unavailable\""),
-        "the audit record must carry the approval outcome: {stderr}"
+        stderr.contains("\"approval\":\"granted\""),
+        "the answer must be audited as granted: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("\"approval_token_id\":\"{token_id}\"")),
+        "the granted record must carry the same token label: {stderr}"
     );
 }
 

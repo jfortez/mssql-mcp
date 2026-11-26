@@ -338,6 +338,27 @@ fn error_text(result: &Value) -> &str {
         .unwrap_or_else(|| panic!("tool error without text: {result}"))
 }
 
+/// The relay question: a structured result, never an error.
+fn approval_question(result: &Value) -> &Value {
+    assert_eq!(
+        result["isError"], false,
+        "a question is not an error: {result}"
+    );
+    let payload = result
+        .get("structuredContent")
+        .filter(|payload| payload.is_object())
+        .unwrap_or_else(|| panic!("question without structured content: {result}"));
+    assert_eq!(payload["code"], "approval_required", "{result}");
+    payload
+}
+
+fn token_of(result: &Value) -> String {
+    approval_question(result)["approval_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("question without a token: {result}"))
+        .to_owned()
+}
+
 #[test]
 fn initialize_instructions_explain_the_gate_without_changing_it() {
     for mode in ["write", "both"] {
@@ -357,14 +378,14 @@ fn initialize_instructions_explain_the_gate_without_changing_it() {
                 "{mode}: the instructions must name {expected:?}: {instructions}"
             );
         }
-        // Discovery is not a bypass: the same client still cannot mutate.
+        // Discovery is not a bypass: the same client still has to answer.
         let result = server.call_tool(
             "insert_row",
             json!({"table": {"name": "Items"}, "values": {"id": 1}}),
         );
         assert_eq!(
-            approval_error(&result)["code"],
-            "approval_unavailable",
+            approval_question(&result)["mutation_outcome"],
+            "not_attempted",
             "{mode}: instructions must not change the gate: {result}"
         );
         thread::sleep(CONNECTION_GRACE);
@@ -387,42 +408,194 @@ fn initialize_instructions_explain_the_gate_without_changing_it() {
 }
 
 #[test]
-fn a_client_without_elicitation_gets_approval_unavailable_without_connecting() {
+fn a_client_without_elicitation_gets_a_question_without_connecting() {
     let peer = CountingPeer::start();
     let mut server = Server::start("write", peer.port, Yolo::Off, false);
     let result = server.call_tool(
         "insert_row",
-        json!({"table": {"name": "Items"}, "values": {"id": 1}}),
+        json!({"table": {"schema": "sales", "name": "Items"}, "values": {"id": 1}}),
     );
-    let error = approval_error(&result);
-    assert_eq!(error["code"], "approval_unavailable", "{result}");
-    assert_eq!(error["mutation_outcome"], "not_attempted", "{result}");
-    assert_eq!(error["retryable"], false, "{result}");
+    let question = approval_question(&result);
+    assert_eq!(question["mutation_outcome"], "not_attempted", "{result}");
+    assert_eq!(question["row_cap"], 100, "{result}");
+    assert_eq!(question["expires_in_seconds"], 120, "{result}");
+    assert_eq!(question["code"], "approval_required", "{result}");
+    let token = token_of(&result);
+    assert_eq!(token.len(), 32, "the token must be unguessable: {token}");
     assert!(
-        error["action"]
-            .as_str()
-            .is_some_and(|action| !action.is_empty()),
-        "approval refusal without guidance: {result}"
+        token.chars().all(|character| character.is_ascii_hexdigit()),
+        "the token must be hexadecimal: {token}"
     );
-    let text = error_text(&result);
-    assert_eq!(text, error["message"], "{result}");
-    for remedy in ["elicitation", "--yolo"] {
+    assert_eq!(
+        question["approval_token_id"],
+        json!(&token[..8]),
+        "the recorded label must be the token prefix: {result}"
+    );
+    let message = question["approval_message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("question without the human message: {result}"));
+    for expected in ["insert_row", "sales.Items", "id", "100"] {
         assert!(
-            text.contains(remedy),
-            "the refusal must name {remedy:?} as a remedy: {text}"
+            message.contains(expected),
+            "the question must name {expected:?}: {message}"
         );
     }
+    let text = error_text(&result);
+    assert!(
+        text.contains(&token) && text.contains("grant") && text.contains("deny"),
+        "a text-only client must be able to relay the question: {text}"
+    );
     thread::sleep(CONNECTION_GRACE);
     assert_eq!(
         peer.attempts(),
         0,
-        "a mutation that was not approved must not connect"
+        "asking the question must not reach SQL Server"
+    );
+    let audit = server.audit_record("insert_row");
+    assert_eq!(audit["approval"], "required", "{audit}");
+    assert_eq!(audit["approval_token_id"], json!(&token[..8]), "{audit}");
+    assert!(
+        audit.get("affected_rows").is_none(),
+        "nothing ran, so no row count exists: {audit}"
+    );
+    assert_eq!(audit["scope"], json!({"schema": "sales", "table": "Items"}));
+}
+
+#[test]
+fn the_relay_runs_only_the_statement_the_token_was_issued_for_once() {
+    let peer = CountingPeer::start();
+    let mut server = Server::start("write", peer.port, Yolo::Off, false);
+    let statement = |id: i64| json!({"table": {"name": "Items"}, "values": {"id": id}});
+
+    let token = token_of(&server.call_tool("insert_row", statement(1)));
+    // A token for one batch can never run another one.
+    let mut other = statement(2);
+    other["approval_token"] = json!(token);
+    other["approval_decision"] = json!("grant");
+    let refusal = server.call_tool("insert_row", other);
+    assert_eq!(
+        approval_error(&refusal)["code"],
+        "approval_token_mismatch",
+        "{refusal}"
     );
     assert_eq!(
-        server.audit_record("insert_row")["approval"],
-        "unavailable",
-        "the audit trail must record the unavailable approval"
+        approval_error(&refusal)["mutation_outcome"],
+        "not_attempted"
     );
+    assert_eq!(peer.attempts(), 0, "a swapped batch must not connect");
+
+    // The exact statement the human saw runs once, and only after the answer.
+    let mut retry = statement(1);
+    retry["approval_token"] = json!(token);
+    retry["approval_decision"] = json!("grant");
+    let granted = server.call_tool("insert_row", retry.clone());
+    assert_eq!(
+        approval_error(&granted)["code"],
+        "connection_failed",
+        "a granted retry must reach the database layer: {granted}"
+    );
+    let audit = server.audit_record("insert_row");
+    assert_eq!(audit["approval"], "granted", "{audit}");
+    assert_eq!(audit["approval_token_id"], json!(&token[..8]), "{audit}");
+
+    // The same token cannot run the same batch twice.
+    let replay = server.call_tool("insert_row", retry);
+    assert_eq!(
+        approval_error(&replay)["code"],
+        "approval_token_reused",
+        "{replay}"
+    );
+    thread::sleep(CONNECTION_GRACE);
+    assert_eq!(
+        peer.attempts(),
+        1,
+        "the replay must not open a second connection"
+    );
+}
+
+#[test]
+fn a_relayed_denial_is_an_answer_and_cannot_be_replayed() {
+    let peer = CountingPeer::start();
+    let mut server = Server::start("both", peer.port, Yolo::Off, false);
+    let statement = json!({"table": {"name": "Items"}, "filters": {"id": 1}});
+    let token = token_of(&server.call_tool("delete_rows", statement.clone()));
+
+    let mut denial = statement.clone();
+    denial["approval_token"] = json!(token);
+    denial["approval_decision"] = json!("deny");
+    let denied = server.call_tool("delete_rows", denial.clone());
+    assert_eq!(
+        approval_error(&denied)["code"],
+        "approval_denied",
+        "{denied}"
+    );
+    assert_eq!(approval_error(&denied)["mutation_outcome"], "not_attempted");
+    let audit = server.audit_record("delete_rows");
+    assert_eq!(audit["approval"], "denied", "{audit}");
+    assert_eq!(audit["approval_token_id"], json!(&token[..8]), "{audit}");
+    thread::sleep(CONNECTION_GRACE);
+    assert_eq!(peer.attempts(), 0, "a denial must never connect");
+
+    // Denial is final for that token: a later grant is refused, not executed.
+    let mut replayed = statement;
+    replayed["approval_token"] = json!(token);
+    replayed["approval_decision"] = json!("grant");
+    let replay = server.call_tool("delete_rows", replayed);
+    assert_eq!(
+        approval_error(&replay)["code"],
+        "approval_token_reused",
+        "{replay}"
+    );
+    assert_eq!(peer.attempts(), 0, "a denied token must stay unusable");
+    let replay_audit = server.audit_record("delete_rows");
+    assert_eq!(
+        replay_audit["code"], "approval_token_reused",
+        "{replay_audit}"
+    );
+    assert!(
+        replay_audit.get("approval").is_none(),
+        "a refused token records no decision: {replay_audit}"
+    );
+}
+
+#[test]
+fn an_unknown_or_incomplete_relay_is_named_and_never_connects() {
+    let peer = CountingPeer::start();
+    let mut server = Server::start("write", peer.port, Yolo::Off, false);
+    let statement = json!({"table": {"name": "Items"}, "values": {"id": 1}});
+    server.call_tool("insert_row", statement.clone());
+
+    for (case, arguments, code) in [
+        (
+            "unknown token",
+            json!({"approval_token": "0123456789abcdef0123456789abcdef", "approval_decision": "grant"}),
+            "approval_token_unknown",
+        ),
+        (
+            "token without a decision",
+            json!({"approval_token": "0123456789abcdef0123456789abcdef"}),
+            "approval_token_invalid",
+        ),
+        (
+            "decision without a token",
+            json!({"approval_decision": "grant"}),
+            "approval_token_invalid",
+        ),
+    ] {
+        let mut retry = statement.clone();
+        for (key, value) in arguments.as_object().expect("object arguments") {
+            retry[key] = value.clone();
+        }
+        let result = server.call_tool("insert_row", retry);
+        assert_eq!(approval_error(&result)["code"], code, "{case}: {result}");
+        assert_eq!(
+            approval_error(&result)["mutation_outcome"],
+            "not_attempted",
+            "{case}: {result}"
+        );
+    }
+    thread::sleep(CONNECTION_GRACE);
+    assert_eq!(peer.attempts(), 0, "no refusal may reach SQL Server");
 }
 
 #[test]
@@ -580,8 +753,8 @@ fn cancelling_a_tool_call_with_pending_approval_does_not_connect() {
 fn yolo_skips_the_prompt_and_reaches_the_database() {
     for yolo in [Yolo::Flag, Yolo::Env] {
         let (port, _peer) = support::dropping_peer();
-        // The client cannot elicit, so any prompt attempt would surface as
-        // `approval_unavailable` instead of reaching the database layer.
+        // The client cannot elicit, so the call must ask instead of reaching the
+        // database layer.
         let mut server = Server::start("write", port, yolo, false);
         let result = server.call_tool(
             "insert_row",
@@ -609,8 +782,8 @@ fn yolo_skips_the_prompt_and_reaches_the_database() {
         json!({"table": {"name": "Items"}, "values": {"id": 1}}),
     );
     assert_eq!(
-        approval_error(&result)["code"],
-        "approval_unavailable",
+        approval_question(&result)["code"],
+        "approval_required",
         "MSSQL_MCP_YOLO=false must not skip the gate: {result}"
     );
     thread::sleep(CONNECTION_GRACE);
