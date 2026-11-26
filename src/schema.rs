@@ -4,7 +4,10 @@
 //! statement planner, so identifiers never become SQL. Every query is bounded
 //! like a read (100 rows, 16 columns, 1,024 UTF-16 units per cell), and the
 //! rendered tree has its own size budget. Any cut sets `truncated` and ends the
-//! output with a visible `… truncated` line.
+//! output with a visible `… truncated` line. Cuts inside one table or one body
+//! are also marked where they happen (`… N columns omitted`,
+//! `… N definition units omitted`) so a bounded page never silently drops part
+//! of an object.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -343,6 +346,28 @@ struct RelationRow {
     referenced_schema: String,
     referenced_table: String,
     referenced_column: String,
+    name: String,
+    ordinal: usize,
+}
+
+/// One foreign key: the constraint identity and every column pair it covers.
+struct RelationEdge<'a> {
+    child_schema: &'a str,
+    child_table: &'a str,
+    parent_schema: &'a str,
+    parent_table: &'a str,
+    name: &'a str,
+    /// Child → parent columns in constraint ordinal order.
+    pairs: Vec<(&'a str, &'a str)>,
+}
+
+impl RelationEdge<'_> {
+    /// Constraint identity plus both column lists, so two constraints to the
+    /// same target stay distinguishable.
+    fn label(&self) -> String {
+        let (child, parent) = pair_columns(&self.pairs);
+        format!("{}: {child} → {parent}", self.name)
+    }
 }
 
 struct ViewRow {
@@ -375,12 +400,18 @@ pub(crate) struct Catalog {
     procedures: Vec<RoutineRow>,
     functions: Vec<FunctionRow>,
     definitions: BTreeMap<(String, String), String>,
+    /// Set as soon as the definitions page runs, so an absent body can be told
+    /// apart from a body nobody asked for.
+    definitions_read: bool,
     truncated: bool,
 }
 
 impl Catalog {
     pub(crate) fn absorb(&mut self, part: Part, read: ReadOutput) {
         self.truncated |= read.truncated;
+        if part == Part::Definitions {
+            self.definitions_read = true;
+        }
         for row in read.rows {
             match part {
                 Part::Tables => self.tables.push(TableRow {
@@ -403,6 +434,8 @@ impl Catalog {
                     referenced_schema: cell(&row, 3),
                     referenced_table: cell(&row, 4),
                     referenced_column: cell(&row, 5),
+                    name: cell(&row, 6),
+                    ordinal: number(&row, 7),
                 }),
                 Part::Views => self.views.push(ViewRow {
                     schema: cell(&row, 0),
@@ -434,6 +467,8 @@ impl Catalog {
     }
 
     pub(crate) fn render(&self, filter: Option<&str>) -> (String, bool) {
+        let edges = self.relation_edges();
+        let mut cut = self.truncated;
         let mut schemas: BTreeMap<&str, ()> = BTreeMap::new();
         for table in &self.tables {
             schemas.insert(&table.schema, ());
@@ -455,7 +490,8 @@ impl Catalog {
         for schema in schemas.keys().copied() {
             let mut sections = Vec::new();
             if !self.tables.is_empty() || !self.columns.is_empty() {
-                let tables = self.table_nodes(schema);
+                let (tables, omitted) = self.table_nodes(schema, &edges);
+                cut |= omitted;
                 if !tables.is_empty() {
                     sections.push(Node::Branch("tables".to_owned(), tables));
                 }
@@ -467,13 +503,15 @@ impl Catalog {
                 }
             }
             if !self.procedures.is_empty() {
-                let procedures = self.procedure_nodes(schema);
+                let (procedures, omitted) = self.procedure_nodes(schema);
+                cut |= omitted;
                 if !procedures.is_empty() {
                     sections.push(Node::Branch("procedures".to_owned(), procedures));
                 }
             }
             if !self.functions.is_empty() {
-                let functions = self.function_nodes(schema);
+                let (functions, omitted) = self.function_nodes(schema);
+                cut |= omitted;
                 if !functions.is_empty() {
                     sections.push(Node::Branch("functions".to_owned(), functions));
                 }
@@ -493,14 +531,49 @@ impl Catalog {
 
         let mut tree = Tree::default();
         render_nodes(&roots, "", &mut tree);
-        let truncated = self.truncated || tree.truncated;
+        let truncated = cut || tree.truncated;
         if truncated {
             tree.finish();
         }
         (tree.text, truncated)
     }
 
-    fn table_nodes(&self, schema: &str) -> Vec<Node> {
+    /// Foreign keys grouped by constraint identity and ordered by constraint
+    /// ordinal, so a composite key renders as one edge with every column pair.
+    fn relation_edges(&self) -> Vec<RelationEdge<'_>> {
+        let mut groups: BTreeMap<(&str, &str, &str), Vec<&RelationRow>> = BTreeMap::new();
+        for relation in &self.relations {
+            groups
+                .entry((
+                    &relation.parent_schema,
+                    &relation.parent_table,
+                    &relation.name,
+                ))
+                .or_default()
+                .push(relation);
+        }
+        groups
+            .into_iter()
+            .map(|((child_schema, child_table, name), mut rows)| {
+                rows.sort_by_key(|row| row.ordinal);
+                RelationEdge {
+                    child_schema,
+                    child_table,
+                    parent_schema: rows[0].referenced_schema.as_str(),
+                    parent_table: rows[0].referenced_table.as_str(),
+                    name,
+                    pairs: rows
+                        .iter()
+                        .map(|row| (row.parent_column.as_str(), row.referenced_column.as_str()))
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// Table nodes for one schema plus whether any table lost columns to the
+    /// bounded column page.
+    fn table_nodes(&self, schema: &str, edges: &[RelationEdge<'_>]) -> (Vec<Node>, bool) {
         let mut names = BTreeSet::new();
         for table in self.tables.iter().filter(|table| table.schema == schema) {
             names.insert(table.name.as_str());
@@ -508,7 +581,8 @@ impl Catalog {
         for column in self.columns.iter().filter(|column| column.schema == schema) {
             names.insert(column.table.as_str());
         }
-        names
+        let mut cut = false;
+        let nodes = names
             .into_iter()
             .map(|name| {
                 let columns = self
@@ -541,27 +615,36 @@ impl Catalog {
                         ))
                     })
                     .collect::<Vec<_>>();
-                for relation in self.relations.iter().filter(|relation| {
-                    relation.parent_schema == schema && relation.parent_table == name
-                }) {
+                if count > columns.len() {
+                    children.push(omitted_columns(count - columns.len()));
+                    cut = true;
+                }
+                for edge in edges
+                    .iter()
+                    .filter(|edge| edge.child_schema == schema && edge.child_table == name)
+                {
                     children.push(Node::Leaf(format!(
-                        "outgoing → {}.{}.{}",
-                        relation.referenced_schema,
-                        relation.referenced_table,
-                        relation.referenced_column
+                        "outgoing → {}.{} ({})",
+                        edge.parent_schema,
+                        edge.parent_table,
+                        edge.label()
                     )));
                 }
-                for relation in self.relations.iter().filter(|relation| {
-                    relation.referenced_schema == schema && relation.referenced_table == name
-                }) {
+                for edge in edges
+                    .iter()
+                    .filter(|edge| edge.parent_schema == schema && edge.parent_table == name)
+                {
                     children.push(Node::Leaf(format!(
-                        "incoming ← {}.{}.{}",
-                        relation.parent_schema, relation.parent_table, relation.parent_column
+                        "incoming ← {}.{} ({})",
+                        edge.child_schema,
+                        edge.child_table,
+                        edge.label()
                     )));
                 }
                 Node::Branch(label, children)
             })
-            .collect()
+            .collect();
+        (nodes, cut)
     }
 
     fn view_nodes(&self, schema: &str) -> Vec<Node> {
@@ -579,8 +662,10 @@ impl Catalog {
             .collect()
     }
 
-    fn procedure_nodes(&self, schema: &str) -> Vec<Node> {
-        self.procedures
+    fn procedure_nodes(&self, schema: &str) -> (Vec<Node>, bool) {
+        let mut cut = false;
+        let nodes = self
+            .procedures
             .iter()
             .filter(|procedure| procedure.schema == schema)
             .map(|procedure| {
@@ -588,13 +673,19 @@ impl Catalog {
                     "{}({}) definition: {} units",
                     procedure.name, procedure.parameters, procedure.definition_units
                 );
-                self.routine_node(schema, &procedure.name, label)
+                let (node, omitted) =
+                    self.routine_node(schema, &procedure.name, label, procedure.definition_units);
+                cut |= omitted;
+                node
             })
-            .collect()
+            .collect();
+        (nodes, cut)
     }
 
-    fn function_nodes(&self, schema: &str) -> Vec<Node> {
-        self.functions
+    fn function_nodes(&self, schema: &str) -> (Vec<Node>, bool) {
+        let mut cut = false;
+        let nodes = self
+            .functions
             .iter()
             .filter(|function| function.schema == schema)
             .map(|function| {
@@ -605,15 +696,38 @@ impl Catalog {
                     function.return_type,
                     function.definition_units
                 );
-                self.routine_node(schema, &function.name, label)
+                let (node, omitted) =
+                    self.routine_node(schema, &function.name, label, function.definition_units);
+                cut |= omitted;
+                node
             })
-            .collect()
+            .collect();
+        (nodes, cut)
     }
 
-    fn routine_node(&self, schema: &str, name: &str, label: String) -> Node {
+    /// Body branch for one routine; a body the bounded read could not deliver
+    /// in full is marked with the units left out.
+    fn routine_node(
+        &self,
+        schema: &str,
+        name: &str,
+        label: String,
+        definition_units: usize,
+    ) -> (Node, bool) {
         match self.definitions.get(&(schema.to_owned(), name.to_owned())) {
-            Some(body) => Node::Branch(label, body_nodes(body)),
-            None => Node::Leaf(label),
+            Some(body) => {
+                let omitted = definition_units.saturating_sub(body.encode_utf16().count());
+                let mut children = body_nodes(body);
+                if omitted > 0 {
+                    children.push(omitted_definition_units(omitted));
+                }
+                (Node::Branch(label, children), omitted > 0)
+            }
+            None if self.definitions_read && definition_units > 0 => (
+                Node::Branch(label, vec![omitted_definition_units(definition_units)]),
+                true,
+            ),
+            None => (Node::Leaf(label), false),
         }
     }
 }
@@ -692,6 +806,34 @@ fn body_nodes(body: &str) -> Vec<Node> {
     nodes
 }
 
+fn omitted_columns(count: usize) -> Node {
+    Node::Leaf(format!("… {count} columns omitted"))
+}
+
+fn omitted_definition_units(count: usize) -> Node {
+    Node::Leaf(format!("… {count} definition units omitted"))
+}
+
+/// Child and parent column lists of one constraint; composites keep the
+/// parentheses so each pair stays readable.
+fn pair_columns(pairs: &[(&str, &str)]) -> (String, String) {
+    let child = pairs
+        .iter()
+        .map(|(child, _)| *child)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parent = pairs
+        .iter()
+        .map(|(_, parent)| *parent)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if pairs.len() == 1 {
+        (child, parent)
+    } else {
+        (format!("({child})"), format!("({parent})"))
+    }
+}
+
 fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if count == 1 { singular } else { plural }
 }
@@ -741,6 +883,7 @@ mod tests {
                     &["dbo", "Groups", "label", "nvarchar(50)", "1", "0"],
                     &["dbo", "Items", "id", "int", "0", "1"],
                     &["dbo", "Items", "group_id", "int", "1", "0"],
+                    &["dbo", "Items", "name", "nvarchar(50)", "1", "0"],
                 ],
                 false,
             ),
@@ -748,18 +891,27 @@ mod tests {
         catalog.absorb(
             Part::Relations,
             read(
-                &[&["dbo", "Items", "group_id", "sales", "Groups", "id"]],
+                &[&[
+                    "dbo",
+                    "Items",
+                    "group_id",
+                    "sales",
+                    "Groups",
+                    "id",
+                    "FK_Items_Groups",
+                    "1",
+                ]],
                 false,
             ),
         );
         catalog.absorb(Part::Views, read(&[&["dbo", "ActiveItems", "2"]], false));
         catalog.absorb(
             Part::Procedures,
-            read(&[&["dbo", "GetItems", "120", "@id int"]], false),
+            read(&[&["dbo", "GetItems", "25", "@id int"]], false),
         );
         catalog.absorb(
             Part::Functions,
-            read(&[&["dbo", "Total", "int", "80", "@x int"]], false),
+            read(&[&["dbo", "Total", "int", "14", "@x int"]], false),
         );
         catalog.absorb(
             Part::Definitions,
@@ -784,18 +936,22 @@ mod tests {
             "Groups (2 columns) pk (id)",
             "label nvarchar(50) NULL",
             "id int NOT NULL",
-            "outgoing → sales.Groups.id",
+            "outgoing → sales.Groups (FK_Items_Groups: group_id → id)",
             "├─ views",
             "ActiveItems (2 columns)",
             "├─ procedures",
-            "GetItems(@id int) definition: 120 units",
+            "GetItems(@id int) definition: 25 units",
             "SELECT id FROM dbo.Items;",
             "└─ functions",
-            "Total(@x int) returns int definition: 80 units",
+            "Total(@x int) returns int definition: 14 units",
             "RETURN @x + 1;",
         ] {
             assert!(tree.contains(expected), "missing {expected:?} in:\n{tree}");
         }
+        assert!(
+            !tree.contains("omitted"),
+            "a complete page must not mark a cut:\n{tree}"
+        );
     }
 
     #[test]
@@ -815,7 +971,7 @@ mod tests {
         let (tree, truncated) = catalog.render(None);
         assert!(!truncated, "{tree}");
         assert!(
-            tree.contains("incoming ← dbo.Items.group_id"),
+            tree.contains("incoming ← dbo.Items (FK_Items_Groups: group_id → id)"),
             "incoming relation missing:\n{tree}"
         );
     }
@@ -825,11 +981,11 @@ mod tests {
         let mut catalog = Catalog::default();
         catalog.absorb(
             Part::Procedures,
-            read(&[&["dbo", "P", "40", "@id int"]], false),
+            read(&[&["dbo", "P", "9", "@id int"]], false),
         );
         catalog.absorb(
             Part::Functions,
-            read(&[&["dbo", "F", "int", "30", "@x int"]], false),
+            read(&[&["dbo", "F", "int", "10", "@x int"]], false),
         );
         catalog.absorb(
             Part::Definitions,
@@ -841,9 +997,9 @@ mod tests {
         let (tree, truncated) = catalog.render(None);
         assert!(truncated);
         for expected in [
-            "P(@id int) definition: 40 units",
+            "P(@id int) definition: 9 units",
             "SELECT 1;",
-            "F(@x int) returns int definition: 30 units",
+            "F(@x int) returns int definition: 10 units",
             "RETURN @x;",
         ] {
             assert!(tree.contains(expected), "missing {expected:?} in:\n{tree}");
@@ -922,6 +1078,235 @@ mod tests {
         assert!(!truncated);
         assert!(
             tree.contains("dbo") && tree.contains("(no objects)"),
+            "{tree}"
+        );
+    }
+
+    #[test]
+    fn a_table_whose_columns_were_cut_marks_the_omitted_columns() {
+        let mut catalog = Catalog::default();
+        catalog.absorb(Part::Tables, read(&[&["dbo", "Items", "22"]], false));
+        let names = (1..=13)
+            .map(|column| format!("c{column}"))
+            .collect::<Vec<_>>();
+        let rows = names
+            .iter()
+            .map(|name| vec!["dbo", "Items", name.as_str(), "int", "0", "0"])
+            .collect::<Vec<_>>();
+        let rows = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        catalog.absorb(Part::Columns, read(&rows, false));
+
+        let (tree, truncated) = catalog.render(None);
+
+        assert!(tree.contains("Items (22 columns)"), "{tree}");
+        assert!(tree.contains("… 9 columns omitted"), "{tree}");
+        assert_eq!(
+            13,
+            tree.matches(" int NOT NULL").count(),
+            "every received column still renders:\n{tree}"
+        );
+        assert!(truncated, "a cut column list must set truncated:\n{tree}");
+    }
+
+    #[test]
+    fn distinct_constraints_to_one_target_keep_their_child_columns() {
+        let mut catalog = Catalog::default();
+        catalog.absorb(
+            Part::Tables,
+            read(
+                &[&["Sales", "Orders", "2"], &["Sales", "Customers", "1"]],
+                false,
+            ),
+        );
+        catalog.absorb(
+            Part::Columns,
+            read(
+                &[
+                    &["Sales", "Orders", "ShipToAddressID", "int", "0", "0"],
+                    &["Sales", "Orders", "BillToAddressID", "int", "0", "0"],
+                    &["Sales", "Customers", "CustomerID", "int", "0", "1"],
+                ],
+                false,
+            ),
+        );
+        catalog.absorb(
+            Part::Relations,
+            read(
+                &[
+                    &[
+                        "Sales",
+                        "Orders",
+                        "ShipToAddressID",
+                        "Sales",
+                        "Customers",
+                        "CustomerID",
+                        "FK_Orders_ShipTo",
+                        "1",
+                    ],
+                    &[
+                        "Sales",
+                        "Orders",
+                        "BillToAddressID",
+                        "Sales",
+                        "Customers",
+                        "CustomerID",
+                        "FK_Orders_BillTo",
+                        "1",
+                    ],
+                ],
+                false,
+            ),
+        );
+
+        let (tree, truncated) = catalog.render(None);
+
+        assert!(!truncated, "{tree}");
+        assert_eq!(2, tree.matches("outgoing →").count(), "{tree}");
+        for expected in [
+            "outgoing → Sales.Customers (FK_Orders_ShipTo: ShipToAddressID → CustomerID)",
+            "outgoing → Sales.Customers (FK_Orders_BillTo: BillToAddressID → CustomerID)",
+        ] {
+            assert!(tree.contains(expected), "missing {expected:?} in:\n{tree}");
+        }
+    }
+
+    #[test]
+    fn a_composite_constraint_renders_every_pair_once_in_ordinal_order() {
+        let mut catalog = Catalog::default();
+        catalog.absorb(
+            Part::Tables,
+            read(&[&["dbo", "Child", "1"], &["dbo", "Parent", "1"]], false),
+        );
+        catalog.absorb(
+            Part::Columns,
+            read(
+                &[
+                    &["dbo", "Child", "part_no", "int", "0", "0"],
+                    &["dbo", "Parent", "id", "int", "0", "1"],
+                ],
+                false,
+            ),
+        );
+        catalog.absorb(
+            Part::Relations,
+            read(
+                &[
+                    &[
+                        "dbo", "Child", "region", "dbo", "Parent", "region", "FK_Two", "2",
+                    ],
+                    &[
+                        "dbo", "Child", "part_no", "dbo", "Parent", "id", "FK_Two", "1",
+                    ],
+                ],
+                false,
+            ),
+        );
+
+        let (tree, truncated) = catalog.render(None);
+
+        assert!(!truncated, "{tree}");
+        assert_eq!(
+            1,
+            tree.matches("outgoing →").count(),
+            "one edge per constraint:\n{tree}"
+        );
+        assert!(
+            tree.contains("outgoing → dbo.Parent (FK_Two: (part_no, region) → (id, region))"),
+            "{tree}"
+        );
+    }
+
+    #[test]
+    fn an_incoming_constraint_names_the_child_table_and_both_columns() {
+        let mut catalog = catalog();
+        catalog.absorb(Part::Tables, read(&[&["sales", "Groups", "1"]], false));
+        catalog.absorb(
+            Part::Columns,
+            read(&[&["sales", "Groups", "id", "int", "0", "1"]], false),
+        );
+
+        let (tree, truncated) = catalog.render(None);
+
+        assert!(!truncated, "{tree}");
+        assert!(
+            tree.contains("incoming ← dbo.Items (FK_Items_Groups: group_id → id)"),
+            "incoming relation missing both columns:\n{tree}"
+        );
+    }
+
+    #[test]
+    fn a_body_cut_by_the_bounded_read_marks_the_omitted_units() {
+        let mut catalog = Catalog::default();
+        catalog.absorb(
+            Part::Procedures,
+            read(&[&["dbo", "GetItems", "4000", "@id int"]], false),
+        );
+        catalog.absorb(
+            Part::Definitions,
+            read(&[&["dbo", "GetItems", "SELECT 1;"]], false),
+        );
+
+        let (tree, truncated) = catalog.render(None);
+
+        assert!(
+            tree.contains("GetItems(@id int) definition: 4000 units"),
+            "{tree}"
+        );
+        assert!(tree.contains("SELECT 1;"), "{tree}");
+        assert!(tree.contains("… 3991 definition units omitted"), "{tree}");
+        assert!(truncated, "a cut body must set truncated:\n{tree}");
+    }
+
+    #[test]
+    fn a_body_left_out_of_the_bounded_read_is_marked_omitted() {
+        let mut catalog = Catalog::default();
+        catalog.absorb(
+            Part::Procedures,
+            read(&[&["dbo", "GetItems", "400", "@id int"]], false),
+        );
+        catalog.absorb(Part::Definitions, read(&[], false));
+
+        let (tree, truncated) = catalog.render(None);
+
+        assert!(
+            tree.contains("GetItems(@id int) definition: 400 units"),
+            "{tree}"
+        );
+        assert!(tree.contains("… 400 definition units omitted"), "{tree}");
+        assert!(truncated, "a missing body must set truncated:\n{tree}");
+    }
+
+    #[test]
+    fn a_routine_whose_body_was_not_requested_is_not_marked_as_cut() {
+        let mut catalog = Catalog::default();
+        catalog.absorb(
+            Part::Procedures,
+            read(&[&["dbo", "GetItems", "400", "@id int"]], false),
+        );
+
+        let (tree, truncated) = catalog.render(None);
+
+        assert!(!truncated, "{tree}");
+        assert!(
+            tree.contains("GetItems(@id int) definition: 400 units") && !tree.contains("omitted"),
+            "{tree}"
+        );
+    }
+
+    #[test]
+    fn a_routine_without_a_body_is_not_marked_as_cut() {
+        let mut catalog = Catalog::default();
+        catalog.absorb(
+            Part::Procedures,
+            read(&[&["dbo", "GetItems", "0", "@id int"]], false),
+        );
+        catalog.absorb(Part::Definitions, read(&[], false));
+
+        let (tree, truncated) = catalog.render(None);
+
+        assert!(!truncated, "{tree}");
+        assert!(
+            tree.contains("GetItems(@id int) definition: 0 units") && !tree.contains("omitted"),
             "{tree}"
         );
     }
