@@ -214,3 +214,9 @@ Tool errors keep `isError`, a human-readable `content[0].text` and a `structured
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+## Working with an agent
+
+Start with `explore_schema` before any query: it returns the schemas, tables, columns, keys, relations and routine signatures in one indented tree, so an agent can see where data lives without guessing. Narrow it with `schema`, or add `definition: true` to read procedure and function bodies.
+
+A reliable order for a new database is `explore_schema` → `describe_table` for the tables that matter → `select_rows` with explicit columns and an `order_by`. Reach for `query` only when the structured tools cannot express the read, and for DDL only with the bypass enabled deliberately.
