@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use rmcp::Peer;
 use rmcp::ServerHandler;
 use rmcp::handler::server::common::schema_for_input;
 use rmcp::model::{
@@ -8,11 +9,11 @@ use rmcp::model::{
     ContentBlock, ErrorCode, Implementation, JsonObject, ListToolsResult, PaginatedRequestParams,
     ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
-use rmcp::service::{RequestContext, RoleServer, ServerInitializeError};
+use rmcp::service::{ElicitationMode, RequestContext, RoleServer, ServerInitializeError};
 use rmcp::transport::async_rw::AsyncRwTransport;
 use serde_json::{Value, json};
 
-use crate::approval::{self, Approves, Decision, Subject};
+use crate::approval::{self, Approves, Decision, Retry, Subject};
 use crate::audit::{self, Scope, Status};
 use crate::catalog::{
     DependencyColumns, ObjectDependencies, RoutineDefinition, SchemaMap, SearchObjects, TableStats,
@@ -22,8 +23,8 @@ use crate::database::{Database, DbError, Outcome, SqlError};
 use crate::query::Query;
 use crate::schema::{Catalog, ExploreSchema};
 use crate::statement::{
-    DeleteRows, DescribeTable, InsertRow, ListTables, SampleRows, SelectRows, Statement, Table,
-    UpdateRows,
+    DeleteRows, DescribeTable, InsertRow, ListTables, MAX_ROWS, SampleRows, SelectRows, Statement,
+    Table, UpdateRows,
 };
 
 #[path = "server_reads.rs"]
@@ -45,12 +46,21 @@ const QUERY_FAILED: &str = "query_failed";
 const TIMEOUT: &str = "timeout";
 const UNRECOGNIZED_RESULT: &str = "unrecognized_result";
 const MUTATION_ROLLED_BACK_CODE: &str = "mutation_rolled_back";
+const APPROVAL_REQUIRED: &str = "approval_required";
 const APPROVAL_DENIED: &str = "approval_denied";
 const APPROVAL_UNAVAILABLE: &str = "approval_unavailable";
+const APPROVAL_TOKEN_UNKNOWN: &str = "approval_token_unknown";
+const APPROVAL_TOKEN_EXPIRED: &str = "approval_token_expired";
+const APPROVAL_TOKEN_REUSED: &str = "approval_token_reused";
+const APPROVAL_TOKEN_MISMATCH: &str = "approval_token_mismatch";
+const APPROVAL_TOKEN_INVALID: &str = "approval_token_invalid";
 
 const NOT_ATTEMPTED: &str = "not_attempted";
 const ROLLED_BACK: &str = "rolled_back";
 const UNKNOWN_OUTCOME: &str = "unknown";
+/// Audit value of the question a non-eliciting client has to answer; the
+/// decision itself is recorded as `granted` or `denied` on the retry.
+const REQUIRED: &str = "required";
 
 const MODE_ACTION: &str = "start the server with a mode that enables this tool";
 const ARGUMENTS_ACTION: &str = "match the tool inputSchema and retry";
@@ -67,23 +77,39 @@ const ROLLBACK_ACTION: &str = "narrow the filters so at most 100 rows change, th
 const APPROVAL_ACTION: &str =
     "accept the approval prompt for the mutation, or start the server with --yolo";
 const APPROVAL_UNAVAILABLE_ACTION: &str =
-    "use a client that supports MCP elicitation, or start the server with --yolo";
+    "check that the client can answer elicitation, or start the server with --yolo";
 const APPROVAL_UNAVAILABLE_MESSAGE: &str = concat!(
-    "the client cannot approve mutations; use a client that supports elicitation ",
+    "the approval prompt could not be delivered to the client; retry it, ",
     "or start the server with --yolo"
 );
+/// What the client has to do with an `approval_required` result.
+const RELAY_ACTION: &str = concat!(
+    "relay approval_message to the human, then repeat this call with approval_token ",
+    "and approval_decision (\"grant\" or \"deny\")"
+);
+const RETRY_QUESTION_ACTION: &str =
+    "repeat the call without approval_token to ask the question again";
+const TOKEN_INVALID_ACTION: &str =
+    "supply approval_token and approval_decision together, or neither";
+const TOKEN_MISMATCH_ACTION: &str = concat!(
+    "repeat the call with exactly the arguments the token was issued for, ",
+    "or ask again without approval_token"
+);
 /// Discovery text advertised in `initialize` so a client learns why a mutation
-/// needs elicitation before it tries one. It only describes the gate: it never
-/// changes which tools are listed or whether approval is required.
+/// needs an answer and how it is asked for before it tries one. It only
+/// describes the gate: it never changes which tools are listed or whether
+/// approval is required.
 const INSTRUCTIONS: &str = concat!(
     "This server runs T-SQL against one configured SQL Server login. ",
-    "insert_row, update_rows, delete_rows and query require explicit human approval through MCP ",
-    "elicitation before any connection is opened; a client that cannot answer elicitation can only ",
-    "read and receives approval_unavailable for those tools. Start the server with --yolo (or ",
-    "MSSQL_MCP_YOLO=true) only when the operator has chosen to bypass that prompt. Read mode exposes ",
-    "only read tools: list_tables, describe_table, select_rows, explore_schema, schema_map, ",
-    "object_dependencies, routine_definition, dependency_columns, search_objects, table_stats ",
-    "and sample_rows."
+    "insert_row, update_rows, delete_rows and query require explicit human approval before any ",
+    "connection is opened: a client that advertises MCP elicitation is asked directly, and any ",
+    "other client receives a non-error approval_required result with a one-shot approval_token, ",
+    "relays that question to the human and repeats the call with approval_token and ",
+    "approval_decision (grant or deny). Nothing reaches SQL Server until that answer arrives. ",
+    "Start the server with --yolo (or MSSQL_MCP_YOLO=true) only when the operator has chosen to ",
+    "bypass that question. Read mode exposes only read tools: list_tables, describe_table, ",
+    "select_rows, explore_schema, schema_map, object_dependencies, routine_definition, ",
+    "dependency_columns, search_objects, table_stats and sample_rows."
 );
 
 #[derive(Clone, Copy)]
@@ -332,6 +358,18 @@ impl ToolError {
         }
     }
 
+    /// Refusal of a relayed retry whose token does not authorize this call.
+    fn token(code: &'static str, message: &'static str, action: &'static str) -> Self {
+        Self {
+            code,
+            message: message.to_owned(),
+            action,
+            retryable: false,
+            mutation_outcome: Some(NOT_ATTEMPTED),
+            sql_error: None,
+        }
+    }
+
     fn from_database(error: DbError, mutation: bool) -> Self {
         let (code, action, retryable) = match &error {
             DbError::Busy => (DATABASE_BUSY, BUSY_ACTION, true),
@@ -411,6 +449,65 @@ fn retry_action(mutation: bool) -> &'static str {
     }
 }
 
+/// The single refusal vocabulary of the relay: every token that cannot
+/// authorize this call is named, and none of them reaches SQL Server.
+fn token_refusal(answer: approval::Answer) -> ToolError {
+    match answer {
+        approval::Answer::Unknown => ToolError::token(
+            APPROVAL_TOKEN_UNKNOWN,
+            "the approval token is not known to this server",
+            RETRY_QUESTION_ACTION,
+        ),
+        approval::Answer::Expired => ToolError::token(
+            APPROVAL_TOKEN_EXPIRED,
+            "the approval token expired before it was answered",
+            RETRY_QUESTION_ACTION,
+        ),
+        approval::Answer::Reused => ToolError::token(
+            APPROVAL_TOKEN_REUSED,
+            "the approval token was already answered",
+            RETRY_QUESTION_ACTION,
+        ),
+        approval::Answer::Mismatch => ToolError::token(
+            APPROVAL_TOKEN_MISMATCH,
+            "the approval token was issued for a different tool or statement",
+            TOKEN_MISMATCH_ACTION,
+        ),
+        // The caller handles a token that did authorize this call; a spent one
+        // reaching here is still a refusal, never an execution.
+        approval::Answer::Granted { .. } | approval::Answer::Denied { .. } => ToolError::token(
+            APPROVAL_TOKEN_INVALID,
+            "the approval token cannot authorize this call",
+            TOKEN_INVALID_ACTION,
+        ),
+    }
+}
+
+/// Structured, non-error question a non-eliciting client relays to the human.
+/// It carries the exact bytes the retry has to repeat and the one-shot token
+/// that authorizes them; nothing has reached SQL Server.
+fn approval_required_result(message: &str, issued: &approval::Issued) -> CallToolResult {
+    let payload = json!({
+        "code": APPROVAL_REQUIRED,
+        "approval_token": issued.token,
+        "approval_token_id": issued.token_id,
+        "approval_message": message,
+        "row_cap": issued.row_cap,
+        "expires_in_seconds": issued.expires_in.as_secs(),
+        "mutation_outcome": NOT_ATTEMPTED,
+        "action": RELAY_ACTION,
+    });
+    let mut result = CallToolResult::structured(payload);
+    result.content = vec![ContentBlock::text(format!(
+        "{message}\n\nNothing has reached SQL Server. Repeat this call with \"approval_token\": \"{token}\" \
+         and \"approval_decision\": \"grant\" or \"deny\". The token expires in {seconds} seconds \
+         and can be used once.",
+        token = issued.token,
+        seconds = issued.expires_in.as_secs(),
+    ))];
+    result
+}
+
 fn rolled_back() -> CallToolResult {
     let legacy = json!({"affected_rows": -1, "error": MUTATION_ROLLED_BACK});
     let mut result = CallToolResult::error(vec![ContentBlock::text(legacy.to_string())]);
@@ -426,6 +523,42 @@ fn rolled_back() -> CallToolResult {
     result
 }
 
+/// One mutation call as the gate sees it: the question to ask, the exact
+/// statement a token has to match, and the facts the audit record needs. Keeping
+/// them in one value keeps every channel on the same decision path.
+struct GateCall<'a> {
+    tool: &'static str,
+    subject: &'a Subject<'a>,
+    statement: &'a Statement,
+    row_cap: Option<u16>,
+    started: Instant,
+    scope: Option<Scope<'a>>,
+}
+
+/// Audit facts of one approval: the recorded outcome and, when a relay token
+/// took part, its short label. The token itself is never recorded.
+#[derive(Clone, Debug)]
+struct Approval {
+    outcome: &'static str,
+    token_id: Option<String>,
+}
+
+impl Approval {
+    fn audited(outcome: &'static str) -> Self {
+        Self {
+            outcome,
+            token_id: None,
+        }
+    }
+
+    fn relayed(outcome: &'static str, token_id: &str) -> Self {
+        Self {
+            outcome,
+            token_id: Some(token_id.to_owned()),
+        }
+    }
+}
+
 /// Bounded result details of one call; `approval` is set only for mutations
 /// that reached the gate.
 #[derive(Default)]
@@ -433,11 +566,13 @@ struct Details {
     rows: Option<usize>,
     affected_rows: Option<i64>,
     truncated: Option<bool>,
-    approval: Option<&'static str>,
+    approval: Option<Approval>,
 }
 
 pub struct McpServer {
     database: Database,
+    /// Questions waiting for a relayed answer; one store per process.
+    relay: approval::Relay,
     mode: Mode,
     yolo: bool,
     tools: Vec<Tool>,
@@ -451,6 +586,7 @@ impl McpServer {
         let tools = build_tools()?;
         Ok(Self {
             database,
+            relay: approval::Relay::new(),
             mode,
             yolo,
             tools,
@@ -498,13 +634,18 @@ impl McpServer {
         // Approval runs before any connection is opened, so a database failure
         // can never be mistaken for an approval failure.
         let approval = if mutation {
-            let decision = match input.approval() {
+            match input.approval() {
                 Some(subject) => {
-                    match self
-                        .approve(name, &subject, context, started, Some(scope))
-                        .await
-                    {
-                        Ok(decision) => decision,
+                    let call = GateCall {
+                        tool: name,
+                        subject: &subject,
+                        statement: &statement,
+                        row_cap: Some(MAX_ROWS),
+                        started,
+                        scope: Some(scope),
+                    };
+                    match self.approve(call, input.relay(), context).await {
+                        Ok(approval) => Some(approval),
                         Err(result) => return result,
                     }
                 }
@@ -515,11 +656,10 @@ impl McpServer {
                         started,
                         Some(scope),
                         error,
-                        Some(Decision::Unavailable.audit_name()),
+                        Some(Approval::audited(Decision::Unavailable.audit_name())),
                     );
                 }
-            };
-            Some(decision)
+            }
         } else {
             None
         };
@@ -591,49 +731,134 @@ impl McpServer {
         }
     }
 
-    /// Ask for approval and map a refusal into the recorded tool error. The
-    /// caller returns the error result when this fails.
+    /// The one gate that decides whether a mutation may run. `--yolo` bypasses
+    /// it; every other call is answered by the client's own elicitation prompt
+    /// when it advertises one, and by the relay when it does not. Both channels
+    /// end in the same decision and the same audit facts.
     async fn approve(
         &self,
-        tool: &'static str,
-        subject: &Subject<'_>,
+        call: GateCall<'_>,
+        retry: Retry<'_>,
         context: &RequestContext<RoleServer>,
-        started: Instant,
-        scope: Option<Scope<'_>>,
-    ) -> Result<&'static str, CallToolResult> {
+    ) -> Result<Approval, CallToolResult> {
+        if self.yolo {
+            return Ok(Approval::audited(Decision::Yolo.audit_name()));
+        }
+        if !elicitation_supported(&context.peer) {
+            return self.redeem(call, retry);
+        }
         let decision = tokio::select! {
-            decision = approval::gate(&context.peer, subject, self.yolo) => decision,
+            decision = approval::gate(&context.peer, call.subject) => decision,
             _ = context.ct.cancelled() => {
                 return Err(self.failed(
-                    tool,
-                    started,
-                    scope,
+                    call.tool,
+                    call.started,
+                    call.scope,
                     ToolError::approval_denied(),
-                    Some(Decision::Denied.audit_name()),
+                    Some(Approval::audited(Decision::Denied.audit_name())),
                 ));
             }
         };
         if context.ct.is_cancelled() {
             return Err(self.failed(
-                tool,
-                started,
-                scope,
+                call.tool,
+                call.started,
+                call.scope,
                 ToolError::approval_denied(),
-                Some(decision.audit_name()),
+                Some(Approval::audited(decision.audit_name())),
             ));
         }
         if decision.permitted() {
-            return Ok(decision.audit_name());
+            return Ok(Approval::audited(decision.audit_name()));
         }
         let error = if decision == Decision::Denied {
             ToolError::approval_denied()
         } else {
             ToolError::approval_unavailable()
         };
-        Err(self.failed(tool, started, scope, error, Some(decision.audit_name())))
+        Err(self.failed(
+            call.tool,
+            call.started,
+            call.scope,
+            error,
+            Some(Approval::audited(decision.audit_name())),
+        ))
     }
 
-    /// One raw batch: approval always precedes the connection and the prompt
+    /// The relay channel: the first call asks and runs nothing, a retry answers
+    /// the question and runs only when the token still authorizes these exact
+    /// bytes. Nothing here opens a connection by itself.
+    fn redeem(&self, call: GateCall<'_>, retry: Retry<'_>) -> Result<Approval, CallToolResult> {
+        let now = Instant::now();
+        match (retry.token, retry.decision) {
+            (None, None) => {
+                let issued = self.relay.issue(
+                    now,
+                    call.tool,
+                    call.statement.clone(),
+                    call.row_cap,
+                    approval::RELAY_TTL,
+                );
+                Err(self.question(call, &issued))
+            }
+            (Some(token), Some(decision)) => {
+                match self
+                    .relay
+                    .answer(now, token, decision, call.tool, call.statement)
+                {
+                    approval::Answer::Granted { token_id } => {
+                        Ok(Approval::relayed(Decision::Granted.audit_name(), &token_id))
+                    }
+                    approval::Answer::Denied { token_id } => Err(self.failed(
+                        call.tool,
+                        call.started,
+                        call.scope,
+                        ToolError::approval_denied(),
+                        Some(Approval::relayed(Decision::Denied.audit_name(), &token_id)),
+                    )),
+                    refusal => Err(self.failed(
+                        call.tool,
+                        call.started,
+                        call.scope,
+                        token_refusal(refusal),
+                        None,
+                    )),
+                }
+            }
+            _ => Err(self.failed(
+                call.tool,
+                call.started,
+                call.scope,
+                ToolError::token(
+                    APPROVAL_TOKEN_INVALID,
+                    "approval_token and approval_decision must be supplied together",
+                    TOKEN_INVALID_ACTION,
+                ),
+                None,
+            )),
+        }
+    }
+
+    /// Record and return the relay question. It is not an error: the client has
+    /// to show it to the human and repeat the call with the answer.
+    fn question(&self, call: GateCall<'_>, issued: &approval::Issued) -> CallToolResult {
+        let message = call.subject.message();
+        let approval = Approval::relayed(REQUIRED, &issued.token_id);
+        self.record(
+            Some(call.tool),
+            call.started,
+            Status::Ok,
+            None,
+            call.scope,
+            Details {
+                approval: Some(approval),
+                ..Details::default()
+            },
+        );
+        approval_required_result(&message, issued)
+    }
+
+    /// One raw batch: approval always precedes the connection and the question
     /// carries the exact SQL. No scope can be validated from arbitrary text.
     async fn query(
         &self,
@@ -666,9 +891,26 @@ impl McpServer {
                 );
             }
         };
-        let subject = Subject::batch(name, &input.sql);
-        let approval = match self.approve(name, &subject, context, started, None).await {
-            Ok(decision) => decision,
+        let Some(subject) = input.approval() else {
+            let error = ToolError::approval_unavailable();
+            return self.failed(
+                name,
+                started,
+                None,
+                error,
+                Some(Approval::audited(Decision::Unavailable.audit_name())),
+            );
+        };
+        let call = GateCall {
+            tool: name,
+            subject: &subject,
+            statement: &statement,
+            row_cap: None,
+            started,
+            scope: None,
+        };
+        let approval = match self.approve(call, input.relay(), context).await {
+            Ok(approval) => approval,
             Err(result) => return result,
         };
         match self.database.execute(statement).await {
@@ -800,7 +1042,7 @@ impl McpServer {
         started: Instant,
         scope: Option<Scope<'_>>,
         error: ToolError,
-        approval: Option<&'static str>,
+        approval: Option<Approval>,
     ) -> CallToolResult {
         self.record(
             Some(tool),
@@ -835,9 +1077,21 @@ impl McpServer {
             rows: details.rows,
             affected_rows: details.affected_rows,
             truncated: details.truncated,
-            approval: details.approval,
+            approval: details.approval.as_ref().map(|approval| approval.outcome),
+            approval_token_id: details
+                .approval
+                .as_ref()
+                .and_then(|approval| approval.token_id.as_deref()),
         });
     }
+}
+
+/// Elicitation is the first channel whenever the client advertised it; the
+/// relay answers every other client, including one whose capabilities are
+/// unknown because the transport carries no client context per request.
+fn elicitation_supported(peer: &Peer<RoleServer>) -> bool {
+    peer.supported_elicitation_modes()
+        .contains(&ElicitationMode::Form)
 }
 
 impl ServerHandler for McpServer {
@@ -1056,25 +1310,25 @@ fn build_tools() -> Result<Vec<Tool>, &'static str> {
         .with_annotations(read()),
         Tool::new(
             Known::InsertRow.name(),
-            "Insert one row and report the number of affected rows.",
+            "Insert one row and report the number of affected rows; needs human approval, answered through elicitation or an approval_token retry.",
             schema_for_input::<InsertRow>().map_err(|_| "tool schema generation failed")?,
         )
         .with_annotations(insert()),
         Tool::new(
             Known::UpdateRows.name(),
-            "Update at most 100 rows matching equality filters.",
+            "Update at most 100 rows matching equality filters; needs human approval, answered through elicitation or an approval_token retry.",
             schema_for_input::<UpdateRows>().map_err(|_| "tool schema generation failed")?,
         )
         .with_annotations(destructive()),
         Tool::new(
             Known::DeleteRows.name(),
-            "Delete at most 100 rows matching equality filters.",
+            "Delete at most 100 rows matching equality filters; needs human approval, answered through elicitation or an approval_token retry.",
             schema_for_input::<DeleteRows>().map_err(|_| "tool schema generation failed")?,
         )
         .with_annotations(destructive()),
         Tool::new(
             Known::Query.name(),
-            "Run one arbitrary T-SQL batch under the configured login after approval; at most one result set is returned, bounded to 100 rows.",
+            "Run one arbitrary T-SQL batch under the configured login after approval, answered through elicitation or an approval_token retry; at most one result set is returned, bounded to 100 rows.",
             schema_for_input::<Query>().map_err(|_| "tool schema generation failed")?,
         )
         .with_annotations(destructive()),
@@ -1244,6 +1498,99 @@ mod tests {
             assert!(
                 json["structuredContent"].get("sql_error").is_none(),
                 "a result-shape failure carries no server diagnostics: {json}"
+            );
+        }
+    }
+
+    fn question(row_cap: Option<u16>) -> Value {
+        let issued = approval::Issued {
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            token_id: "01234567".to_owned(),
+            expires_in: approval::RELAY_TTL,
+            row_cap,
+        };
+        let result = approval_required_result("Approve insert_row on dbo.Items.", &issued);
+        serde_json::to_value(result).expect("a question serializes to JSON")
+    }
+
+    #[test]
+    fn the_relay_question_is_not_an_error_and_carries_what_the_human_sees() {
+        let json = question(Some(MAX_ROWS));
+        assert_eq!(json["isError"], false, "{json}");
+        let payload = &json["structuredContent"];
+        assert_eq!(payload["code"], APPROVAL_REQUIRED, "{json}");
+        assert_eq!(
+            payload["approval_token"], "0123456789abcdef0123456789abcdef",
+            "{json}"
+        );
+        assert_eq!(payload["approval_token_id"], "01234567", "{json}");
+        assert_eq!(
+            payload["approval_message"],
+            "Approve insert_row on dbo.Items."
+        );
+        assert_eq!(payload["row_cap"], MAX_ROWS, "{json}");
+        assert_eq!(payload["expires_in_seconds"], 120, "{json}");
+        assert_eq!(payload["mutation_outcome"], NOT_ATTEMPTED, "{json}");
+        assert!(
+            payload["action"]
+                .as_str()
+                .is_some_and(|action| action.contains("approval_decision")),
+            "{json}"
+        );
+        let text = json["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a question carries text: {json}"));
+        for expected in [
+            "Approve insert_row on dbo.Items.",
+            "0123456789abcdef0123456789abcdef",
+            "grant",
+            "deny",
+            "Nothing has reached SQL Server",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+
+        // A raw batch has no affected-row cap, so the question says so instead
+        // of inventing one.
+        assert_eq!(question(None)["structuredContent"]["row_cap"], Value::Null);
+    }
+
+    #[test]
+    fn every_unusable_token_is_a_named_refusal_that_claims_no_outcome() {
+        for (answer, code) in [
+            (approval::Answer::Unknown, APPROVAL_TOKEN_UNKNOWN),
+            (approval::Answer::Expired, APPROVAL_TOKEN_EXPIRED),
+            (approval::Answer::Reused, APPROVAL_TOKEN_REUSED),
+            (approval::Answer::Mismatch, APPROVAL_TOKEN_MISMATCH),
+            (
+                approval::Answer::Granted {
+                    token_id: "01234567".to_owned(),
+                },
+                APPROVAL_TOKEN_INVALID,
+            ),
+            (
+                approval::Answer::Denied {
+                    token_id: "01234567".to_owned(),
+                },
+                APPROVAL_TOKEN_INVALID,
+            ),
+        ] {
+            let json = wire(token_refusal(answer.clone()));
+            assert_eq!(json["isError"], true, "{answer:?}: {json}");
+            assert_eq!(
+                json["structuredContent"]["code"], code,
+                "{answer:?}: {json}"
+            );
+            assert_eq!(
+                json["structuredContent"]["mutation_outcome"], NOT_ATTEMPTED,
+                "{answer:?}: {json}"
+            );
+            assert_eq!(json["structuredContent"]["retryable"], false, "{json}");
+            assert!(
+                json["structuredContent"]["action"]
+                    .as_str()
+                    .is_some_and(|action| !action.is_empty()),
+                "{answer:?}: {json}"
             );
         }
     }

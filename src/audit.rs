@@ -6,7 +6,8 @@
 //! call with a known tool name, the effective mode, a status and code, the
 //! duration, the validated scope, bounded result counts and, for mutations, the
 //! approval outcome. Values, SQL text, credentials, filter contents and
-//! unvalidated identifiers are never recorded.
+//! unvalidated identifiers are never recorded; a relayed question contributes
+//! only its short token label, never the token or the question text.
 
 use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -80,6 +81,10 @@ pub struct CallRecord<'a> {
     /// Approval outcome of a mutation that reached the gate; absent for reads
     /// and for refusals that happened before the gate.
     pub approval: Option<&'static str>,
+    /// Short label of the relayed question that took part in this call; absent
+    /// unless the client answered through a relay token. The token itself is
+    /// never recorded.
+    pub approval_token_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -119,6 +124,8 @@ struct ToolCallRecord<'a> {
     truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     approval: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_token_id: Option<&'a str>,
 }
 
 pub fn startup(mode: Mode, auth: &str, tls_verify: bool) {
@@ -153,6 +160,7 @@ pub fn call(record: CallRecord<'_>) {
         affected_rows: record.affected_rows,
         truncated: record.truncated,
         approval: record.approval,
+        approval_token_id: record.approval_token_id,
     });
 }
 
