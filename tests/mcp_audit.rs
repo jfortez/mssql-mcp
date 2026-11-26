@@ -358,7 +358,8 @@ fn write_connection_failure_is_audited_as_not_attempted() {
 
 #[test]
 fn refused_mutation_is_audited_as_unavailable_and_reads_have_no_approval() {
-    let mut server = Server::start_with("both", closed_port(), false);
+    let (port, _peer) = support::dropping_peer();
+    let mut server = Server::start_with("both", port, false);
     let response = server.call_tool(
         "delete_rows",
         json!({"table": {"name": "Items"}, "filters": {"id": 1}}),
