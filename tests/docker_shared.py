@@ -40,7 +40,7 @@ def verify_client(token, name):
     })
     assert initialize["serverInfo"]["name"] == "mssql-mcp"
     tools = post("tools/list", 2, {})["tools"]
-    assert {tool["name"] for tool in tools} == {"list_tables", "describe_table", "select_rows"}
+    assert {tool["name"] for tool in tools} == {"list_tables", "describe_table", "select_rows", "explore_schema"}
     result = post("tools/call", 3, {
         "name": "select_rows", "arguments": {
             "table": {"name": "Items"}, "columns": ["id"], "filters": {"id": 1000},

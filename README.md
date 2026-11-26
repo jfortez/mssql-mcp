@@ -24,6 +24,7 @@ Every setting is a command-line flag and an environment variable. Use the enviro
 | `MSSQL_DOMAIN` | — | Windows domain, unqualified | required for `ntlm` |
 | `MSSQL_PORT` | `--port` | 1–65535; the instance's TCP port | `1433` |
 | `MSSQL_MODE` | `--mode` | `read`, `write`, `both` | `read` |
+| `MSSQL_MCP_YOLO` | `--yolo` | `true` skips the mutation approval prompt (dangerous) | `false` |
 | `MSSQL_MCP_TRANSPORT` | `--transport` | `stdio`, `http` | `stdio` |
 | `MSSQL_MCP_HTTP_LISTEN` | `--http-listen` | `IP:port` | `127.0.0.1:8765` |
 | `MSSQL_MCP_TOKEN` | — | 32–128 of `A–Z a–z 0–9 - _`; HTTP only | required for `http` |
@@ -32,7 +33,7 @@ Every setting is a command-line flag and an environment variable. Use the enviro
 
 Authentication modes: `sql` uses `MSSQL_USER`/`MSSQL_PASSWORD`; `ntlm` uses those plus `MSSQL_DOMAIN`; `windows` uses the current Windows process identity, so it is unavailable on Linux and in the Docker image and does not use the two SQL credentials. No mode falls back to another identity.
 
-TLS is required and certificates are validated against the system store: use the hostname in the server certificate. `MSSQL_MODE=read` exposes only `list_tables`, `describe_table` and `select_rows`; `write` exposes `insert_row`, `update_rows` and `delete_rows`; `both` exposes all six. Updates and deletes need at least one filter and roll back when more than 100 rows would change. Give the login only the SQL Server permissions it needs.
+TLS is required and certificates are validated against the system store: use the hostname in the server certificate. `MSSQL_MODE=read` exposes `list_tables`, `describe_table`, `select_rows` and `explore_schema`; `write` exposes `insert_row`, `update_rows`, `delete_rows`, `query` and `explore_schema`; `both` exposes all eight. Updates and deletes need at least one filter and roll back when more than 100 rows would change. Every table mutation asks the client to confirm the target, columns and 100-row cap before connecting; `query` asks before every batch and shows the exact SQL. `--yolo` (or `MSSQL_MCP_YOLO=true`) skips those prompts and the audit trail records the bypass. Give the login only the SQL Server permissions it needs.
 
 Validate without connecting: `mssql-mcp --check-config`. All flags: `mssql-mcp --help`.
 
@@ -51,7 +52,7 @@ mssql-mcp --transport http
 
 The endpoint is `http://127.0.0.1:8765/mcp`. Every request needs `Authorization: Bearer $MSSQL_MCP_TOKEN`, including from loopback. The server rejects foreign `Host` and `Origin` headers, so keep it on loopback and do not add CORS or a reverse proxy.
 
-A second process on the same address fails at bind, so clients keep addressing exactly one endpoint. All clients share the daemon's SQL identity, mode, `read`/`write` surface and its four concurrent database operations; each tool call still opens its own SQL Server connection. Need different identities or modes? Run another daemon on another port.
+A second process on the same address fails at bind, so clients keep addressing exactly one endpoint. All clients share the daemon's SQL identity, mode, `read`/`write` surface and its four concurrent database operations; each tool call still opens its own SQL Server connection. Need different identities or modes? Run another daemon on another port. The stateless HTTP transport cannot show approval prompts, so mutation tools and `query` fail closed with `approval_unavailable` unless the daemon runs with `--yolo`.
 
 ### Native, one client over stdio
 
@@ -170,8 +171,14 @@ The Agent Client Protocol does not carry an MCP transport by itself. An ACP host
 | `insert_row` | `table`, `values` | `affected_rows` |
 | `update_rows` | `table`, `values`, `filters` | `affected_rows` |
 | `delete_rows` | `table`, `filters` | `affected_rows` |
+| `query` | `sql`, `limit?` | `columns`, `rows`, `truncated` for one result set, or `executed` |
+| `explore_schema` | `schema?`, `include?`, `definition?` | `tree`, `truncated` |
 
-`table` is `{"schema": "dbo", "name": "Products"}`; functions such as `schema` default to `dbo`. Filters are equality checks combined with `AND`, `null` matching `NULL`. Selects return 25 rows by default (maximum 100) and projects every column as text, capped at 1,024 UTF-16 units; a `truncated` flag reports a cut cell or page. Use a unique `order_by` for stable pagination. Mutations return `affected_rows: -1` with `mutation_outcome: rolled_back` when the 100-row limit rolled back. There is no raw SQL endpoint.
+`table` is `{"schema": "dbo", "name": "Products"}`; functions such as `schema` default to `dbo`. Filters are equality checks combined with `AND`, `null` matching `NULL`. Selects return 25 rows by default (maximum 100) and projects every column as text, capped at 1,024 UTF-16 units; a `truncated` flag reports a cut cell or page. Use a unique `order_by` for stable pagination. Mutations return `affected_rows: -1` with `mutation_outcome: rolled_back` when the 100-row limit rolled back.
+
+`query` runs one arbitrary T-SQL batch under the configured principal, exactly as sent. It can read or change any data or server state that principal can reach, including other databases, and it has no affected-row cap. Every batch requires approval unless `--yolo`, and the prompt carries the exact SQL so the human consents to the real bytes. At most one result set is returned, bounded to 100 rows by default (`limit` can lower it), 16 columns and 1,024 UTF-16 units per cell; a `truncated` flag reports a cut. A batch with no result set returns `executed: true`; more than one result set is rejected as `unrecognized_result`. A failure or timeout after the batch starts leaves the outcome unknown, and SQL Server permissions remain the real boundary: the approval prompt is a guardrail, not a sandbox.
+
+`explore_schema` is read-only and available in every mode. It returns one indented `tree` string: schemas; under each, tables with column count and primary key, columns with type and nullability, outgoing and incoming foreign-key relations, views, procedures with parameter signatures and definition size, and functions with return type and parameter signatures. `schema` narrows the tree, `include` selects `tables`, `views`, `procedures` and `functions` (all four by default), and `definition: true` inlines procedure and function bodies from `sys.sql_modules`. Catalog queries and the tree itself are bounded; any cut sets `truncated` and ends the tree with a visible `… truncated` line.
 
 ## Audit and errors
 
@@ -183,7 +190,7 @@ JSON Lines on stderr, stdout reserved for MCP. One `tool_call` record per handle
 {"ts":1795707647289,"event":"shutdown","status":"ok"}
 ```
 
-Records carry the known tool name, effective mode, status, error code, duration, the validated `scope` and bounded counters (`rows`, `affected_rows`, `truncated`). They never contain SQL text, values, credentials, host names, result rows or raw driver messages; validated schema and table names do appear. The trail is operational evidence, not a signed or tamper-proof audit log: capture it with your client or supervisor.
+Records carry the known tool name, effective mode, status, error code, duration, the validated `scope` and bounded counters (`rows`, `affected_rows`, `truncated`). Mutation records and every `query` batch that reaches the approval gate add `approval` as `yolo`, `granted`, `denied` or `unavailable`; `explore_schema` and the other read tools never carry it. A `query` record has no `scope`, because arbitrary SQL has no validated target, and it never contains the batch text. Records never contain SQL text, values, credentials, host names, result rows or raw driver messages; validated schema and table names do appear. The trail is operational evidence, not a signed or tamper-proof audit log: capture it with your client or supervisor.
 
 Tool errors keep `isError`, a human-readable `content[0].text` and a `structuredContent` object with `code`, `message`, `action`, `retryable`, and for writes `mutation_outcome`:
 
@@ -192,6 +199,8 @@ Tool errors keep `isError`, a human-readable `content[0].text` and a `structured
 | `mode_unavailable` | tool disabled by `MSSQL_MODE` | `not_attempted` |
 | `invalid_arguments` | arguments do not match the tool schema | `not_attempted` |
 | `invalid_input` | a validated field was rejected | `not_attempted` |
+| `approval_denied` | the human declined or cancelled, or the approval prompt timed out | `not_attempted` |
+| `approval_unavailable` | the client cannot show an approval prompt, or asking it failed | `not_attempted` |
 | `database_busy` | four operations already active | `not_attempted` |
 | `connection_failed` | TCP, TLS or login failed before any statement | `not_attempted` |
 | `authentication_unavailable` | mode missing from this build or platform | `not_attempted` |

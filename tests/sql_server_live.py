@@ -76,9 +76,26 @@ def fixture(image, *, network=None, reader_password=None):
                 SELECT N'trigger result must not escape into MCP' AS trigger_note;
             END;
         """
-        for batch, db in [(create, "master"), (schema, "McpFixture"), (trigger, "McpFixture")]:
-            if sql(name, sa, batch, db).returncode:
-                raise RuntimeError(f"Could not seed isolated database {db}")
+        procedures = """
+            EXEC('CREATE PROCEDURE dbo.usp_items_count AS SELECT COUNT(*) AS total FROM dbo.Items;');
+            EXEC('CREATE SCHEMA probe AUTHORIZATION dbo');
+            ALTER AUTHORIZATION ON SCHEMA::probe TO mcp_writer;
+            GRANT EXECUTE ON dbo.usp_items_count TO mcp_writer;
+            GRANT VIEW DEFINITION ON dbo.usp_items_count TO mcp_writer;
+            GRANT CREATE TABLE TO mcp_writer;
+            GRANT CREATE PROCEDURE TO mcp_writer;
+            GRANT ALTER ON SCHEMA::probe TO mcp_writer;
+        """
+        wide = ("CREATE TABLE dbo.Wide (" + ", ".join(f"c{i} int NULL" for i in range(120))
+                + "); GRANT VIEW DEFINITION ON dbo.Wide TO mcp_writer;")
+        batches = [("create", create, "master"), ("schema", schema, "McpFixture"),
+                   ("trigger", trigger, "McpFixture"), ("procedures", procedures, "McpFixture"),
+                   ("wide", wide, "McpFixture")]
+        for label, batch, db in batches:
+            seeded = sql(name, sa, batch, db)
+            if seeded.returncode:
+                detail = (seeded.stderr or seeded.stdout).strip()[:600]
+                raise RuntimeError(f"Could not seed {label} in {db}: {detail}")
         address = command("docker", "port", name, "1433/tcp").stdout.strip()
         host, port = address.rsplit(":", 1)
         if host != "127.0.0.1":
@@ -134,11 +151,13 @@ class Mcp:
 
 
 @contextlib.contextmanager
-def server(binary, host, port, user, password, mode, *, trust):
+def server(binary, host, port, user, password, mode, *, trust, yolo=False):
     args = [str(binary), "--host", host, "--port", port, "--database", "McpFixture",
             "--auth", "sql", "--mode", mode, "--timeout-seconds", "10"]
     if trust:
         args.append("--trust-server-certificate")
+    if yolo:
+        args.append("--yolo")
     env = {name: value for name, value in os.environ.items() if not name.startswith("MSSQL_")}
     env.update(MSSQL_USER=user, MSSQL_PASSWORD=password)
     with (
@@ -195,24 +214,43 @@ def verify(binary, host, port, reader, writer):
     select_audit = next(record for record in audit_calls(client) if record["tool"] == "select_rows")
     assert select_audit["scope"] == {"schema": "dbo", "table": "Items"}, select_audit
     assert (select_audit["status"], select_audit["rows"], select_audit["truncated"]) == ("ok", 1, True), select_audit
+    assert "approval" not in select_audit, select_audit
     assert b"x" * 100 not in client.stderr
     print("PASS: SQL login, read-mode tools, catalog, typed bindings, bounded text and read audit")
 
-    with server(binary, host, port, "mcp_reader", reader, "both", trust=True) as client:
+    with server(binary, host, port, "mcp_reader", reader, "both", trust=True, yolo=True) as client:
         unprivileged = {"table": table, "values": {"id": 1001, "label": "blocked", "group_id": 2}}
         client.tool("insert_row", unprivileged, error=True)
         assert client.tool("select_rows", {**query, "filters": {"id": 1001}})["rows"] == []
+    unprivileged_audit = next(record for record in audit_calls(client) if record["tool"] == "insert_row")
+    assert unprivileged_audit["approval"] == "yolo", unprivileged_audit
     print("PASS: SQL Server grants still forbid mutations by a read-only login")
 
     with server(binary, host, port, "mcp_writer", writer, "write", trust=True) as client:
+        refused = client.tool(
+            "insert_row",
+            {"table": table, "values": {"id": 1002, "label": "refused", "group_id": 2}},
+            error=True,
+        )
+        detail = refused["result"]["structuredContent"]
+        assert detail["code"] == "approval_unavailable", detail
+        assert detail["mutation_outcome"] == "not_attempted", detail
+        assert detail["retryable"] is False, detail
+        assert "elicitation" in detail["message"] and "--yolo" in detail["message"], detail
+    refusal = next(record for record in audit_calls(client) if record["tool"] == "insert_row")
+    assert (refusal["code"], refusal["approval"]) == ("approval_unavailable", "unavailable"), refusal
+    print("PASS: a mutation without approval and without --yolo is refused before connecting")
+
+    with server(binary, host, port, "mcp_writer", writer, "write", trust=True, yolo=True) as client:
         client.tool("select_rows", query, error=True)
         inserted = {"table": table, "values": {"id": 1001, "label": "O'Brien", "group_id": 2}}
         assert client.tool("insert_row", inserted) == {"affected_rows": 1}
     insert_audit = next(record for record in audit_calls(client) if record["tool"] == "insert_row")
     assert insert_audit["affected_rows"] == 1 and insert_audit["status"] == "ok", insert_audit
+    assert insert_audit["approval"] == "yolo", insert_audit
     for sensitive in ("O'Brien", writer, "trigger result must not escape into MCP"):
         assert sensitive.encode() not in client.stderr
-    with server(binary, host, port, "mcp_writer", writer, "both", trust=True) as client:
+    with server(binary, host, port, "mcp_writer", writer, "both", trust=True, yolo=True) as client:
         inserted_query = {**query, "filters": {"id": 1001}}
         assert client.tool("select_rows", inserted_query)["rows"] == [["1001", "O'Brien"]]
         edit = {"table": table, "values": {"label": None}, "filters": {"id": 1001}}
@@ -227,8 +265,46 @@ def verify(binary, host, port, reader, writer):
         page = {"table": table, "columns": ["id"], "order_by": ["id"], "limit": 1,
                 "offset": 100, "filters": {"group_id": 1}}
         assert client.tool("select_rows", page)["rows"] == [["101"]]
+
+        tree = client.tool("explore_schema", {"definition": True})
+        payload, text = tree, tree["tree"]
+        assert "dbo" in text and "Items" in text and "usp_items_count" in text, text
+        assert "id" in text and "group_id" in text, text
+        assert "CREATE PROCEDURE dbo.usp_items_count" in text, text
+        assert "Wide (120 columns)" in text, text
+        assert payload["truncated"] is True and text.rstrip().endswith("… truncated"), text[-200:]
+        print("PASS: explore_schema renders schemas, columns, relations and procedure bodies, and marks a catalog cut")
+
+        client.tool("query", {"sql": "DROP PROCEDURE dbo.usp_items_count"}, error=True)
+        survived = client.tool("query", {"sql": "SELECT OBJECT_ID('dbo.usp_items_count') AS id"})
+        assert survived["rows"] != [[None]], survived
+
+    with server(binary, host, port, "mcp_writer", writer, "write", trust=True, yolo=True) as client:
+        create = "CREATE PROCEDURE probe.usp_probe_sum @a int, @b int AS SELECT @a + @b AS total"
+        assert client.tool("query", {"sql": create}) == {"executed": True}
+        body = client.tool("query", {"sql": "SELECT OBJECT_DEFINITION(OBJECT_ID('probe.usp_probe_sum')) AS ddl"})
+        assert "@a + @b" in body["rows"][0][0], body
+        alter = "ALTER PROCEDURE probe.usp_probe_sum @a int, @b int AS SELECT @a * @b AS total"
+        assert client.tool("query", {"sql": alter}) == {"executed": True}
+        body = client.tool("query", {"sql": "SELECT OBJECT_DEFINITION(OBJECT_ID('probe.usp_probe_sum')) AS ddl"})
+        assert "@a * @b" in body["rows"][0][0], body
+        executed = client.tool("query", {"sql": "EXEC probe.usp_probe_sum @a = 6, @b = 7"})
+        assert executed["rows"] == [["42"]], executed
+        assert client.tool("query", {"sql": "DROP PROCEDURE probe.usp_probe_sum"}) == {"executed": True}
+        gone = client.tool("query", {"sql": "SELECT OBJECT_ID('probe.usp_probe_sum') AS id"})
+        assert gone["rows"] == [[None]], gone
+    print("PASS: query creates, alters and drops a stored procedure under approval bypass")
+
+    with server(binary, host, port, "mcp_writer", writer, "write", trust=True) as client:
+        refused_query = client.tool("query", {"sql": "SELECT 1 AS n"}, error=True)
+        detail = refused_query["result"]["structuredContent"]
+        assert detail["code"] == "approval_unavailable" and detail["mutation_outcome"] == "not_attempted", detail
+    query_audit = next(record for record in audit_calls(client) if record["tool"] == "query")
+    assert "sql" not in query_audit and "SELECT 1" not in str(query_audit), query_audit
+    print("PASS: query is refused without approval and its text stays out of the audit record")
     reverted = next(record for record in audit_calls(client) if record.get("code") == "mutation_rolled_back")
     assert (reverted["tool"], reverted["status"], reverted["affected_rows"]) == ("delete_rows", "error", -1), reverted
+    assert reverted["approval"] == "yolo", reverted
     print("PASS: write/both, INSERT/UPDATE/DELETE, NULL, sorted paging, audited rollback and value redaction")
 
 
