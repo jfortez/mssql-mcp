@@ -1,0 +1,21 @@
+[package]
+name = "mssql-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Native Model Context Protocol server for Microsoft SQL Server"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["mcp", "mssql", "sql-server", "tds"]
+categories = ["command-line-utilities", "database"]
+include = ["/src/**", "/tests/**", "/README.md", "/assets/icon.svg", "/LICENSE"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
