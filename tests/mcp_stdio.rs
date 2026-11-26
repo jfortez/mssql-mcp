@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+mod support;
+
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
 const READ_TOOLS: &[&str] = &["list_tables", "describe_table", "select_rows"];
@@ -37,8 +39,7 @@ struct McpServer {
 impl McpServer {
     fn start(mode: &str, port: u16) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_mssql-mcp"));
-        command
-            .env_clear()
+        support::clear_env(&mut command)
             .env("MSSQL_USER", "sa")
             .env("MSSQL_PASSWORD", "test-password")
             .args([
@@ -435,8 +436,8 @@ fn write_validation_rejection_is_not_attempted() {
 
 #[test]
 fn client_eof_exits_normally() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mssql-mcp"))
-        .env_clear()
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mssql-mcp"));
+    let mut child = support::clear_env(&mut command)
         .env("MSSQL_USER", "sa")
         .env("MSSQL_PASSWORD", "test-password")
         .args([

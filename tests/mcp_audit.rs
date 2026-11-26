@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+mod support;
+
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const AUDIT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_AUDIT_LINES: usize = 64;
@@ -55,8 +57,7 @@ impl Server {
     fn spawn(mode: &str, port: u16, auth: &str, trust: bool) -> Self {
         let port = port.to_string();
         let mut command = Command::new(env!("CARGO_BIN_EXE_mssql-mcp"));
-        command
-            .env_clear()
+        support::clear_env(&mut command)
             .env("MSSQL_USER", USER)
             .env("MSSQL_PASSWORD", PASSWORD)
             .env("MSSQL_DOMAIN", DOMAIN)

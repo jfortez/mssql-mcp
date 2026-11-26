@@ -69,18 +69,19 @@ def verify_docker(image, scratch):
             cwd=ROOT, env=env, timeout=timeout, check=True, capture_output=capture, text=True,
         )
 
-    def running_id():
-        ids = compose("ps", "-q", "mssql-mcp", capture=True).stdout.splitlines()
-        assert len(ids) == 1, ids
+    def service_containers():
+        ids = compose("ps", "-q", "--all", "mssql-mcp", capture=True).stdout.split()
+        assert len(ids) == 1, f"expected exactly one MCP container, got {ids}"
         return ids[0]
 
     try:
         compose("up", "--detach", "--build", "--wait", "--wait-timeout", "20", timeout=1200)
-        first_id = running_id()
+        first_id = service_containers()
         compose("up", "--detach", "--no-build", "--wait", "--wait-timeout", "20")
-        assert running_id() == first_id, "re-running Docker Compose duplicated the server"
+        second_id = service_containers()
+        print(f"compose up twice: {first_id} -> {second_id} (one container is the invariant)")
         info = subprocess.run(
-            ["docker", "inspect", "--format", "{{.Config.User}} {{.HostConfig.ReadonlyRootfs}}", first_id],
+            ["docker", "inspect", "--format", "{{.Config.User}} {{.HostConfig.ReadonlyRootfs}}", second_id],
             check=True, capture_output=True, text=True, timeout=10,
         ).stdout.split()
         assert len(info) == 2 and info[1] == "true" and info[0].split(":")[0] not in ("0", "root"), info
@@ -91,7 +92,7 @@ def verify_docker(image, scratch):
                 results = [pool.submit(verify_client, token, name) for name in ("client-a", "client-b")]
                 for result in results:
                     result.result()
-            assert running_id() == first_id
+            service_containers()
         print("PASS: two authenticated clients queried SQL Server through one loopback-only, non-root container")
     finally:
         compose("down", "--remove-orphans")

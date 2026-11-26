@@ -7,6 +7,8 @@
 //! configured database port is closed, so dispatched calls fail deterministically.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
+
+mod support;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -537,8 +539,7 @@ impl Drop for Daemon {
 fn daemon_command(addr: SocketAddr, mode: &str, extra: &[String]) -> Command {
     let database_port = free_loopback_port();
     let mut command = Command::new(env!("CARGO_BIN_EXE_mssql-mcp"));
-    command
-        .env_clear()
+    support::clear_env(&mut command)
         .env("MSSQL_USER", "sa")
         .env("MSSQL_PASSWORD", "test-password")
         .env("MSSQL_MCP_TOKEN", TOKEN)

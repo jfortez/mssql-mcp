@@ -1,8 +1,12 @@
 use std::process::{Command, Output};
 
+mod support;
+
 fn run(args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mssql-mcp"));
-    cmd.env_clear().envs(env.iter().copied()).args(args);
+    support::clear_env(&mut cmd)
+        .envs(env.iter().copied())
+        .args(args);
     cmd.output().unwrap()
 }
 

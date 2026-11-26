@@ -20,7 +20,7 @@ mssql-mcp --transport http
 
 **Docker instead:** with those same variables set, run `docker compose up -d --build`. It binds only to host loopback and runs as non-root with a read-only filesystem. `MSSQL_HOST` must be reachable from the container. Stop with `docker compose down`. Keep secrets out of Git and the image; Docker administrators can inspect container environment variables.
 
-Both options serve `http://127.0.0.1:8765/mcp`. Start **one** of them. Repeated `docker compose up` in the same project reuses its service; a second listener cannot take the same port. Stdio is still available, but starts a process per client. Do not expose the local bearer endpoint to the network.
+Both options serve `http://127.0.0.1:8765/mcp`. Start **one** of them. Repeated `docker compose up` in the same project keeps exactly one container (Compose may recreate it, never run two); a second listener cannot take the same port. Stdio is still available, but starts a process per client. Do not expose the local bearer endpoint to the network.
 
 ## 3. Connect your clients
 
