@@ -328,3 +328,351 @@ mod tests {
         assert!(!html.contains("<script") && !html.contains("<link"));
     }
 }
+
+#[cfg(test)]
+mod safety {
+    use super::*;
+
+    fn viewbox(html: &str) -> (usize, usize) {
+        let needle = "viewBox=\"0 0 ";
+        let start = html.find(needle).expect("viewBox") + needle.len();
+        let rest = &html[start..];
+        let end = rest.find('"').expect("viewBox close");
+        let mut parts = rest[..end].split(' ');
+        (
+            parts.next().unwrap().parse().unwrap(),
+            parts.next().unwrap().parse().unwrap(),
+        )
+    }
+
+    /// Every tag the renderer emits: name plus attribute names, lowercased.
+    fn tags(html: &str) -> Vec<(String, Vec<String>)> {
+        let mut out = Vec::new();
+        let mut index = 0;
+        while let Some(offset) = html[index..].find('<') {
+            let at = index + offset;
+            let next = match html[at + 1..].chars().next() {
+                Some(character) => character,
+                None => break,
+            };
+            if !(next.is_ascii_alphabetic() || next == '/' || next == '!') {
+                index = at + 1;
+                continue;
+            }
+            let end = match html[at..].find('>') {
+                Some(length) => at + length,
+                None => break,
+            };
+            let body = &html[at + 1..end];
+            if body.starts_with('!') || body.starts_with('/') {
+                out.push((body.to_lowercase(), Vec::new()));
+            } else {
+                let mut words = body.split_whitespace();
+                let name = words.next().unwrap_or_default().to_lowercase();
+                let mut rest = words.collect::<Vec<_>>().join(" ");
+                let mut attrs = Vec::new();
+                while let Some(eq) = rest.find('=') {
+                    let key = rest[..eq].trim().to_lowercase();
+                    if !key.is_empty() {
+                        attrs.push(key);
+                    }
+                    let after = &rest[eq + 1..];
+                    if let Some(stripped) = after.strip_prefix('"') {
+                        match stripped.find('"') {
+                            Some(quote) => rest = stripped[quote + 1..].to_string(),
+                            None => break,
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                out.push((name, attrs));
+            }
+            index = end + 1;
+        }
+        out
+    }
+
+    fn tags_with_class<'a>(html: &'a str, marker: &str) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(offset) = html[from..].find(marker) {
+            let at = from + offset;
+            let start = html[..at].rfind('<').expect("tag start");
+            let end = at + html[at..].find('>').expect("tag end");
+            out.push(&html[start..end]);
+            from = end;
+        }
+        out
+    }
+
+    fn number(tag: &str, name: &str) -> usize {
+        let needle = format!("{name}=\"");
+        let start = tag
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{name} in {tag}"))
+            + needle.len();
+        let rest = &tag[start..];
+        let end = rest.find('"').expect("attribute close");
+        rest[..end].parse().expect("numeric attribute")
+    }
+
+    fn path_numbers(html: &str) -> Vec<usize> {
+        let mut numbers = Vec::new();
+        let mut from = 0;
+        while let Some(offset) = html[from..].find(" d=\"") {
+            let at = from + offset + 4;
+            let end = at + html[at..].find('"').expect("path d close");
+            let data = &html[at..end];
+            assert!(
+                !data.contains('-') && !data.contains('.'),
+                "path geometry must stay non-negative and integral: {data}"
+            );
+            for token in data.split(|c: char| c == ' ' || c.is_ascii_alphabetic()) {
+                if token.is_empty() {
+                    continue;
+                }
+                numbers.push(token.parse::<usize>().expect("path coordinate"));
+            }
+            from = end;
+        }
+        numbers
+    }
+
+    fn assert_inside(html: &str, width: usize, height: usize) {
+        let mut boxes = 0;
+        for marker in [
+            "class=\"node\"",
+            "class=\"node external\"",
+            "class=\"schema-frame\"",
+        ] {
+            for tag in tags_with_class(html, marker) {
+                let (x, y, w, h) = (
+                    number(tag, "x"),
+                    number(tag, "y"),
+                    number(tag, "width"),
+                    number(tag, "height"),
+                );
+                assert!(x + w <= width, "{marker} overflows width: {tag}");
+                assert!(y + h <= height, "{marker} overflows height: {tag}");
+                boxes += 1;
+            }
+        }
+        for value in path_numbers(html) {
+            assert!(
+                value <= width.max(height),
+                "edge coordinate {value} outside canvas"
+            );
+        }
+        assert!(boxes > 0, "expected at least one box");
+    }
+
+    #[test]
+    fn hostile_catalog_names_never_inject_markup() {
+        let map = Diagram {
+            nodes: BTreeMap::from([
+                (
+                    1,
+                    Node {
+                        schema: "A<script>alert(1)</script>",
+                        table: "x\" data-evil=\"1 onload=\"alert(2)",
+                        columns: Some(1),
+                    },
+                ),
+                (
+                    2,
+                    Node {
+                        schema: "style</style><style>body{display:none}",
+                        table: "'><img src=x onerror=alert(3)>",
+                        columns: None,
+                    },
+                ),
+            ]),
+            edges: vec![Edge {
+                name: "fk<javascript:alert(4)>\"&amp;",
+                child: 1,
+                referenced: 2,
+                columns: vec![("c\" onclick=\"alert(5)", "r<script>alert(6)</script>")],
+            }],
+            expressions_truncated: true,
+        };
+        let html = render(&map);
+        let forbidden_tags = [
+            "script",
+            "style>body",
+            "link",
+            "iframe",
+            "img",
+            "object",
+            "embed",
+            "form",
+            "input",
+            "base",
+            "source",
+            "use",
+            "image",
+        ];
+        let allowed_attrs: &[&str] = &[
+            "charset",
+            "name",
+            "content",
+            "lang",
+            "role",
+            "viewbox",
+            "width",
+            "height",
+            "aria-label",
+            "tabindex",
+            "class",
+            "x",
+            "y",
+            "rx",
+            "id",
+            "refx",
+            "refy",
+            "markerwidth",
+            "markerheight",
+            "orient",
+            "d",
+            "marker-end",
+        ];
+        let mut style_tags = 0;
+        for (name, attrs) in tags(&html) {
+            assert!(
+                !forbidden_tags.contains(&name.as_str()),
+                "catalog text created a <{name}> element"
+            );
+            if name == "style" {
+                style_tags += 1;
+            }
+            for attr in attrs {
+                assert!(
+                    allowed_attrs.contains(&attr.as_str()),
+                    "unexpected attribute {attr} from catalog text"
+                );
+                assert!(!attr.starts_with("on"), "event handler attribute {attr}");
+            }
+        }
+        assert_eq!(style_tags, 1, "exactly one document stylesheet");
+        assert_eq!(html.matches("<style>").count(), 1);
+        assert_eq!(html.matches("</style>").count(), 1);
+        for forbidden in [
+            "@import",
+            "url(http",
+            "url(//",
+            "url(data:",
+            "http://",
+            "https://",
+        ] {
+            assert!(
+                !html.contains(forbidden),
+                "unexpected {forbidden} in output"
+            );
+        }
+        for (index, _) in html.match_indices("url(") {
+            assert!(
+                html[index..].starts_with("url(#"),
+                "only same-document references are allowed"
+            );
+        }
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(html.contains("&lt;img src=x onerror=alert(3)&gt;"));
+        assert!(html.contains("&quot;"));
+    }
+
+    #[test]
+    fn geometry_survives_empty_single_and_many_tables() {
+        let empty = render(&Diagram::default());
+        assert!(empty.contains("No visible tables matched the selection."));
+        assert!(!empty.contains("<svg"));
+
+        let single = Diagram {
+            nodes: BTreeMap::from([(
+                7,
+                Node {
+                    schema: "dbo",
+                    table: "Only",
+                    columns: Some(0),
+                },
+            )]),
+            ..Default::default()
+        };
+        let html = render(&single);
+        let (width, height) = viewbox(&html);
+        assert!(width > 0 && height > 0);
+        assert_inside(&html, width, height);
+        assert!(!html.contains("class=\"edge\""), "no edges expected");
+
+        let mut nodes = BTreeMap::new();
+        let mut edges = Vec::new();
+        for id in 0..250 {
+            nodes.insert(
+                id,
+                Node {
+                    schema: match id % 4 {
+                        0 => "SalesLT",
+                        1 => "dbo",
+                        2 => "Warehouse",
+                        _ => "VeryLongSchemaNameThatWillBeShortenedForDisplay",
+                    },
+                    table: "Table with a fairly long descriptive name for layout",
+                    columns: Some(id as usize % 9),
+                },
+            );
+            edges.push(Edge {
+                name: "FK_many",
+                child: id,
+                referenced: (id + 1) % 250,
+                columns: vec![("Child", "Parent")],
+            });
+            if id % 40 == 0 {
+                edges.push(Edge {
+                    name: "FK_self",
+                    child: id,
+                    referenced: id,
+                    columns: vec![("Self", "Self")],
+                });
+            }
+        }
+        edges.push(Edge {
+            name: "FK_dangling",
+            child: 0,
+            referenced: 99_999,
+            columns: vec![],
+        });
+        let many = Diagram {
+            nodes,
+            edges,
+            expressions_truncated: false,
+        };
+        let html = render(&many);
+        let (width, height) = viewbox(&html);
+        assert_inside(&html, width, height);
+        assert_eq!(html.matches("class=\"schema-frame\"").count(), 4);
+        assert_eq!(html.matches("class=\"edge\"").count(), 257);
+        assert!(!html.contains("FK_dangling"));
+
+        let long_name = "t".repeat(5_000);
+        let long = Diagram {
+            nodes: BTreeMap::from([(
+                1,
+                Node {
+                    schema: &long_name,
+                    table: &long_name,
+                    columns: None,
+                },
+            )]),
+            edges: vec![Edge {
+                name: &long_name,
+                child: 1,
+                referenced: 1,
+                columns: vec![(&long_name, &long_name)],
+            }],
+            expressions_truncated: false,
+        };
+        let html = render(&long);
+        let (width, height) = viewbox(&html);
+        assert_inside(&html, width, height);
+        assert!(html.contains('…'), "long labels are shortened");
+    }
+}
