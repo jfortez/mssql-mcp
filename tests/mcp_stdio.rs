@@ -16,6 +16,11 @@ const READ_TOOLS: &[&str] = &[
     "describe_table",
     "select_rows",
     "explore_schema",
+    "schema_map",
+    "object_dependencies",
+    "search_objects",
+    "table_stats",
+    "sample_rows",
 ];
 const WRITE_TOOLS: &[&str] = &[
     "insert_row",
@@ -33,6 +38,11 @@ const ALL_TOOLS: &[&str] = &[
     "delete_rows",
     "query",
     "explore_schema",
+    "schema_map",
+    "object_dependencies",
+    "search_objects",
+    "table_stats",
+    "sample_rows",
 ];
 
 fn closed_port() -> u16 {
@@ -359,7 +369,19 @@ fn tools_expose_object_input_schemas() {
         );
     }
 
-    // Annotations describe the same eight tools: reads are read-only and
+    for properties in [
+        &select["inputSchema"]["properties"],
+        &query["inputSchema"]["properties"],
+    ] {
+        assert_eq!(properties["limit"]["minimum"], 1);
+        assert_eq!(properties["limit"]["maximum"], 100);
+    }
+    assert_eq!(
+        select["inputSchema"]["properties"]["columns"]["maxItems"],
+        64
+    );
+
+    // Annotations describe the tool list: reads are read-only and
     // idempotent, insert is additive, update/delete are destructive, and query
     // may change anything the configured login can reach.
     let expected = [
@@ -477,7 +499,7 @@ fn malformed_arguments_are_rejected_before_database_access() {
     );
     assert_eq!(
         tool_error_text(&result),
-        "columns must contain between 1 and 16 names"
+        "columns must contain between 1 and 64 names"
     );
     let error = structured_error(&result);
     assert_eq!(error["code"], "invalid_input");
@@ -496,12 +518,89 @@ fn malformed_arguments_are_rejected_before_database_access() {
     );
     assert_eq!(
         tool_error_text(&result),
-        "invalid arguments for select_rows"
+        "invalid select_rows field: unknown"
     );
     let error = structured_error(&result);
     assert_eq!(error["code"], "invalid_arguments");
     assert_eq!(error["retryable"], false);
     server.close();
+}
+
+#[test]
+fn select_reports_the_invalid_field_and_accepts_wide_projections() {
+    let mut server = McpServer::start("read", closed_port());
+    for (args, field) in [
+        (json!({"table": {"name": "Items"}}), "columns"),
+        (
+            json!({"table": {"name": "Items", "schema": 3}, "columns": ["id"]}),
+            "table.schema",
+        ),
+        (
+            json!({"table": {"name": "Items"}, "columns": ["id"], "limit": -1}),
+            "limit",
+        ),
+    ] {
+        let result = server.call_tool("select_rows", args);
+        assert_eq!(structured_error(&result)["code"], "invalid_arguments");
+        assert_eq!(
+            tool_error_text(&result),
+            format!("invalid select_rows field: {field}")
+        );
+    }
+    let columns: Vec<_> = (0..22).map(|index| format!("col{index}")).collect();
+    let result = server.call_tool(
+        "select_rows",
+        json!({"table": {"name": "Items"}, "columns": columns}),
+    );
+    assert_eq!(structured_error(&result)["code"], "connection_failed");
+    server.close();
+}
+
+#[test]
+fn catalog_tools_validate_and_follow_read_mode_gating() {
+    let inputs = [
+        ("schema_map", json!({"limit": 0}), json!({})),
+        (
+            "object_dependencies",
+            json!({"object": {"name": ""}}),
+            json!({"object": {"name": "Items"}}),
+        ),
+        (
+            "search_objects",
+            json!({"query": ""}),
+            json!({"query": "Items"}),
+        ),
+        (
+            "table_stats",
+            json!({"table": {"name": ""}}),
+            json!({"table": {"name": "Items"}}),
+        ),
+        (
+            "sample_rows",
+            json!({"table": {"name": "Items"}, "limit": 26}),
+            json!({"table": {"name": "Items"}}),
+        ),
+    ];
+    let mut read = McpServer::start("read", closed_port());
+    let mut write = McpServer::start("write", closed_port());
+    for (tool, invalid, valid) in inputs {
+        assert_eq!(
+            structured_error(&read.call_tool(tool, invalid))["code"],
+            "invalid_input",
+            "{tool}"
+        );
+        let attempted = read.call_tool(tool, valid.clone());
+        let error = structured_error(&attempted);
+        assert_eq!(error["code"], "connection_failed", "{tool}");
+        assert!(error.get("mutation_outcome").is_none(), "{tool}");
+        assert_eq!(
+            structured_error(&write.call_tool(tool, valid))["code"],
+            "mode_unavailable",
+            "{tool}"
+        );
+    }
+    read.close();
+    write.close();
 }
 
 #[test]

@@ -542,7 +542,7 @@ fn unvalidated_targets_are_not_audited() {
     assert_eq!(error["code"], "invalid_arguments");
     assert_eq!(
         response["content"][0]["text"],
-        "invalid arguments for select_rows"
+        "invalid select_rows field: columns"
     );
     let record = server.next_audit();
     assert_eq!(record.json["code"], "invalid_arguments", "{}", record.raw);

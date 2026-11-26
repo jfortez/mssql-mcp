@@ -27,11 +27,16 @@ const IO_TIMEOUT: Duration = Duration::from_secs(20);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 
-const READ_TOOLS: [&str; 4] = [
+const READ_TOOLS: [&str; 9] = [
     "list_tables",
     "describe_table",
     "select_rows",
     "explore_schema",
+    "schema_map",
+    "object_dependencies",
+    "search_objects",
+    "table_stats",
+    "sample_rows",
 ];
 const WRITE_TOOLS: [&str; 5] = [
     "insert_row",

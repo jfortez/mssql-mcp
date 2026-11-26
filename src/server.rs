@@ -14,13 +14,18 @@ use serde_json::{Value, json};
 
 use crate::approval::{self, Approves, Decision, Subject};
 use crate::audit::{self, Scope, Status};
+use crate::catalog::{ObjectDependencies, SchemaMap, SearchObjects, TableStats};
 use crate::config::{Mode, Settings, Transport};
 use crate::database::{Database, DbError, Outcome, SqlError};
 use crate::query::Query;
 use crate::schema::{Catalog, ExploreSchema};
 use crate::statement::{
-    DeleteRows, DescribeTable, InsertRow, ListTables, SelectRows, Statement, Table, UpdateRows,
+    DeleteRows, DescribeTable, InsertRow, ListTables, SampleRows, SelectRows, Statement, Table,
+    UpdateRows,
 };
+
+#[path = "server_reads.rs"]
+mod reads;
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MUTATION_ROLLED_BACK: &str = "mutation exceeded the 100-row limit and was rolled back";
@@ -28,6 +33,7 @@ const MUTATION_ROLLED_BACK: &str = "mutation exceeded the 100-row limit and was 
 const MODE_UNAVAILABLE: &str = "mode_unavailable";
 const INVALID_ARGUMENTS: &str = "invalid_arguments";
 const INVALID_INPUT: &str = "invalid_input";
+const OBJECT_NOT_FOUND: &str = "object_not_found";
 const UNKNOWN_TOOL: &str = "unknown_tool";
 const DATABASE_BUSY: &str = "database_busy";
 const CONNECTION_FAILED: &str = "connection_failed";
@@ -72,7 +78,8 @@ const INSTRUCTIONS: &str = concat!(
     "elicitation before any connection is opened; a client that cannot answer elicitation can only ",
     "read and receives approval_unavailable for those tools. Start the server with --yolo (or ",
     "MSSQL_MCP_YOLO=true) only when the operator has chosen to bypass that prompt. Read mode exposes ",
-    "only list_tables, describe_table, select_rows and explore_schema."
+    "only read tools: list_tables, describe_table, select_rows, explore_schema, schema_map, ",
+    "object_dependencies, search_objects, table_stats and sample_rows."
 );
 
 #[derive(Clone, Copy)]
@@ -85,9 +92,14 @@ enum Known {
     DeleteRows,
     Query,
     ExploreSchema,
+    SchemaMap,
+    ObjectDependencies,
+    SearchObjects,
+    TableStats,
+    SampleRows,
 }
 
-const KNOWN: [Known; 8] = [
+const KNOWN: [Known; 13] = [
     Known::ListTables,
     Known::DescribeTable,
     Known::SelectRows,
@@ -96,6 +108,11 @@ const KNOWN: [Known; 8] = [
     Known::DeleteRows,
     Known::Query,
     Known::ExploreSchema,
+    Known::SchemaMap,
+    Known::ObjectDependencies,
+    Known::SearchObjects,
+    Known::TableStats,
+    Known::SampleRows,
 ];
 
 impl Known {
@@ -109,6 +126,11 @@ impl Known {
             Self::DeleteRows => "delete_rows",
             Self::Query => "query",
             Self::ExploreSchema => "explore_schema",
+            Self::SchemaMap => "schema_map",
+            Self::ObjectDependencies => "object_dependencies",
+            Self::SearchObjects => "search_objects",
+            Self::TableStats => "table_stats",
+            Self::SampleRows => "sample_rows",
         }
     }
 
@@ -124,7 +146,15 @@ impl Known {
         match mode {
             Mode::Read => matches!(
                 self,
-                Self::ListTables | Self::DescribeTable | Self::SelectRows | Self::ExploreSchema
+                Self::ListTables
+                    | Self::DescribeTable
+                    | Self::SelectRows
+                    | Self::ExploreSchema
+                    | Self::SchemaMap
+                    | Self::ObjectDependencies
+                    | Self::SearchObjects
+                    | Self::TableStats
+                    | Self::SampleRows
             ),
             Mode::Write => matches!(
                 self,
@@ -231,6 +261,17 @@ impl ToolError {
             action: INPUT_ACTION,
             retryable: false,
             mutation_outcome: tool.is_mutation().then_some(NOT_ATTEMPTED),
+            sql_error: None,
+        }
+    }
+
+    fn not_found() -> Self {
+        Self {
+            code: OBJECT_NOT_FOUND,
+            message: "database object not found or not visible to the configured login".to_owned(),
+            action: "check the object name, schema, and login permissions",
+            retryable: false,
+            mutation_outcome: None,
             sql_error: None,
         }
     }
@@ -825,22 +866,8 @@ impl ServerHandler for McpServer {
                 })
                 .await
             }
-            Known::DescribeTable => {
-                self.invoke(
-                    tool,
-                    arguments,
-                    &context,
-                    started,
-                    |input: &DescribeTable| input.prepare(),
-                )
-                .await
-            }
-            Known::SelectRows => {
-                self.invoke(tool, arguments, &context, started, |input: &SelectRows| {
-                    input.prepare()
-                })
-                .await
-            }
+            Known::DescribeTable => self.describe_table(arguments, started).await,
+            Known::SelectRows => self.select_rows(arguments, started).await,
             Known::InsertRow => {
                 self.invoke(tool, arguments, &context, started, |input: &InsertRow| {
                     input.prepare()
@@ -861,6 +888,47 @@ impl ServerHandler for McpServer {
             }
             Known::Query => self.query(arguments, &context, started).await,
             Known::ExploreSchema => self.explore_schema(arguments, started).await,
+            Known::SampleRows => self.sample_rows(arguments, started).await,
+            Known::SchemaMap => {
+                self.catalog_call(
+                    tool,
+                    arguments,
+                    started,
+                    SchemaMap::plan,
+                    |plan| async move { plan.execute(&self.database).await },
+                )
+                .await
+            }
+            Known::ObjectDependencies => {
+                self.catalog_call(
+                    tool,
+                    arguments,
+                    started,
+                    ObjectDependencies::plan,
+                    |plan| async move { plan.execute(&self.database).await },
+                )
+                .await
+            }
+            Known::SearchObjects => {
+                self.catalog_call(
+                    tool,
+                    arguments,
+                    started,
+                    SearchObjects::plan,
+                    |plan| async move { plan.execute(&self.database).await },
+                )
+                .await
+            }
+            Known::TableStats => {
+                self.catalog_call(
+                    tool,
+                    arguments,
+                    started,
+                    TableStats::plan,
+                    |plan| async move { plan.execute(&self.database).await },
+                )
+                .await
+            }
         };
         Ok(result.into())
     }
@@ -971,6 +1039,11 @@ fn build_tools() -> Result<Vec<Tool>, &'static str> {
             schema_for_input::<ExploreSchema>().map_err(|_| "tool schema generation failed")?,
         )
         .with_annotations(read()),
+        Tool::new(Known::SchemaMap.name(), "Page through a machine-readable catalog of schemas, objects, columns, keys, indexes and routine signatures.", schema_for_input::<SchemaMap>().map_err(|_| "tool schema generation failed")?).with_annotations(read()),
+        Tool::new(Known::ObjectDependencies.name(), "Page through incoming and outgoing SQL-expression and foreign-key dependencies.", schema_for_input::<ObjectDependencies>().map_err(|_| "tool schema generation failed")?).with_annotations(read()),
+        Tool::new(Known::SearchObjects.name(), "Find objects and columns by a literal name fragment.", schema_for_input::<SearchObjects>().map_err(|_| "tool schema generation failed")?).with_annotations(read()),
+        Tool::new(Known::TableStats.name(), "Return approximate partition row counts and paged index storage sizes without a table scan.", schema_for_input::<TableStats>().map_err(|_| "tool schema generation failed")?).with_annotations(read()),
+        Tool::new(Known::SampleRows.name(), "Sample up to 25 rows using the first 64 columns in catalog order.", schema_for_input::<SampleRows>().map_err(|_| "tool schema generation failed")?).with_annotations(read()),
     ])
 }
 
