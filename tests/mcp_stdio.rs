@@ -269,6 +269,17 @@ fn tool_error_text(result: &Value) -> &str {
         .unwrap_or_else(|| panic!("tool error without text: {result}"))
 }
 
+/// A closed loopback port fails as a refused connection on Unix and can hit the
+/// operation deadline first on Windows; either way it is a transport failure,
+/// never a validation or approval failure.
+fn assert_transport_failure(error: &Value, tool: &str) {
+    let code = error["code"].as_str().unwrap_or_default();
+    assert!(
+        matches!(code, "connection_failed" | "timeout"),
+        "{tool} reported {code}: {error}"
+    );
+}
+
 fn structured_error(result: &Value) -> &Value {
     assert_eq!(
         result["isError"], true,
@@ -544,7 +555,7 @@ fn select_reports_the_invalid_field_and_accepts_wide_projections() {
         "select_rows",
         json!({"table": {"name": "Items"}, "columns": columns}),
     );
-    assert_eq!(structured_error(&result)["code"], "connection_failed");
+    assert_transport_failure(structured_error(&result), "select_rows");
     server.close();
 }
 
@@ -583,7 +594,7 @@ fn catalog_tools_validate_and_follow_read_mode_gating() {
         );
         let attempted = read.call_tool(tool, valid.clone());
         let error = structured_error(&attempted);
-        assert_eq!(error["code"], "connection_failed", "{tool}");
+        assert_transport_failure(error, tool);
         assert!(error.get("mutation_outcome").is_none(), "{tool}");
         assert_eq!(
             structured_error(&write.call_tool(tool, valid))["code"],
