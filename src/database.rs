@@ -40,6 +40,8 @@ pub enum Outcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DbError {
     Busy,
+    /// The connection, TLS or login handshake failed before any statement ran.
+    Connect,
     Timeout,
     Failed,
     UnsupportedAuth,
@@ -54,6 +56,7 @@ impl DbError {
                 "database operation timed out; the mutation outcome is unknown"
             }
             (Self::Timeout, false) => "database operation timed out",
+            (Self::Connect, _) => "database operation failed",
             (Self::Failed, true) => "database operation failed; the mutation outcome is unknown",
             (Self::Failed, false) => "database operation failed",
             (Self::UnsupportedAuth, _) => "authentication method is not available in this build",
@@ -124,11 +127,11 @@ impl Database {
 
         let stream = TcpStream::connect((self.settings.host.as_str(), self.settings.port))
             .await
-            .map_err(|_| DbError::Failed)?;
-        stream.set_nodelay(true).map_err(|_| DbError::Failed)?;
+            .map_err(|_| DbError::Connect)?;
+        stream.set_nodelay(true).map_err(|_| DbError::Connect)?;
         Client::connect(config, stream.compat_write())
             .await
-            .map_err(|_| DbError::Failed)
+            .map_err(|_| DbError::Connect)
     }
 }
 

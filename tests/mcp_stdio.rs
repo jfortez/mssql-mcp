@@ -227,6 +227,17 @@ fn tool_error_text(result: &Value) -> &str {
         .unwrap_or_else(|| panic!("tool error without text: {result}"))
 }
 
+fn structured_error(result: &Value) -> &Value {
+    assert_eq!(
+        result["isError"], true,
+        "expected a tool error, got {result}"
+    );
+    result
+        .get("structuredContent")
+        .filter(|error| error.is_object())
+        .unwrap_or_else(|| panic!("tool error without structured content: {result}"))
+}
+
 #[test]
 fn mode_lists_are_fixed() {
     for (mode, expected) in [
@@ -288,7 +299,16 @@ fn disallowed_tools_are_rejected_without_connecting() {
         tool_error_text(&result),
         "tool is not available in read mode"
     );
-    assert!(result.get("structuredContent").is_none());
+    let error = structured_error(&result);
+    assert_eq!(error["code"], "mode_unavailable");
+    assert_eq!(error["retryable"], false);
+    assert_eq!(error["mutation_outcome"], "not_attempted");
+    assert!(
+        error["action"]
+            .as_str()
+            .is_some_and(|action| !action.is_empty()),
+        "mode rejection without guidance: {result}"
+    );
     server.close();
 
     let mut server = McpServer::start("write", port);
@@ -297,6 +317,9 @@ fn disallowed_tools_are_rejected_without_connecting() {
         tool_error_text(&result),
         "tool is not available in write mode"
     );
+    let error = structured_error(&result);
+    assert_eq!(error["code"], "mode_unavailable");
+    assert!(error.get("mutation_outcome").is_none());
     server.close();
 }
 
@@ -313,6 +336,18 @@ fn valid_read_against_closed_loopback_returns_a_sanitized_error() {
         ),
         "unexpected database error text: {text}"
     );
+    let error = structured_error(&result);
+    assert_eq!(error["message"], text);
+    assert_eq!(error["code"], "connection_failed");
+    assert_eq!(error["retryable"], false);
+    assert!(error.get("mutation_outcome").is_none());
+    assert!(
+        error["action"]
+            .as_str()
+            .is_some_and(|action| !action.is_empty()),
+        "database error without guidance: {result}"
+    );
+    let reply = result.to_string();
     for leaked in [
         "127.0.0.1",
         "Connection refused",
@@ -324,11 +359,10 @@ fn valid_read_against_closed_loopback_returns_a_sanitized_error() {
         "SELECT",
     ] {
         assert!(
-            !text.contains(leaked),
-            "database error leaked {leaked:?}: {text}"
+            !reply.contains(leaked),
+            "database error leaked {leaked:?}: {reply}"
         );
     }
-    assert!(result.get("structuredContent").is_none());
     server.close();
 }
 
@@ -344,12 +378,16 @@ fn malformed_arguments_are_rejected_before_database_access() {
         tool_error_text(&result),
         "columns must contain between 1 and 16 names"
     );
+    let error = structured_error(&result);
+    assert_eq!(error["code"], "invalid_input");
+    assert_eq!(error["retryable"], false);
 
     let result = server.call_tool(
         "select_rows",
         json!({"table": {"name": "Items"}, "columns": ["id"], "limit": 0}),
     );
     assert_eq!(tool_error_text(&result), "limit must be between 1 and 100");
+    assert_eq!(structured_error(&result)["code"], "invalid_input");
 
     let result = server.call_tool(
         "select_rows",
@@ -359,6 +397,39 @@ fn malformed_arguments_are_rejected_before_database_access() {
         tool_error_text(&result),
         "invalid arguments for select_rows"
     );
+    let error = structured_error(&result);
+    assert_eq!(error["code"], "invalid_arguments");
+    assert_eq!(error["retryable"], false);
+    server.close();
+}
+
+#[test]
+fn write_validation_rejection_is_not_attempted() {
+    let port = closed_port();
+    let mut server = McpServer::start("write", port);
+    let result = server.call_tool(
+        "insert_row",
+        json!({"table": {"name": "Items"}, "values": {}}),
+    );
+    assert_eq!(
+        tool_error_text(&result),
+        "values must contain between 1 and 16 entries"
+    );
+    let error = structured_error(&result);
+    assert_eq!(error["code"], "invalid_input");
+    assert_eq!(error["mutation_outcome"], "not_attempted");
+
+    let result = server.call_tool(
+        "delete_rows",
+        json!({"table": {"name": "Items"}, "filters": "bad"}),
+    );
+    assert_eq!(
+        tool_error_text(&result),
+        "invalid arguments for delete_rows"
+    );
+    let error = structured_error(&result);
+    assert_eq!(error["code"], "invalid_arguments");
+    assert_eq!(error["mutation_outcome"], "not_attempted");
     server.close();
 }
 
