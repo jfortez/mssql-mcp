@@ -227,13 +227,13 @@ Tool errors keep `isError`, a human-readable `content[0].text` and a `structured
 | `database_busy` | four operations already active | `not_attempted` |
 | `connection_failed` | TCP, TLS or login failed before any statement | `not_attempted` |
 | `authentication_unavailable` | mode missing from this build or platform | `not_attempted` |
-| `query_failed` | SQL Server rejected the statement | `rolled_back` after confirming a generated mutation did not commit; otherwise omitted |
+| `query_failed` | SQL Server rejected the statement | `rolled_back` after confirming a generated mutation did not commit; omitted otherwise |
 | `query_failed` | connection or driver failed during execution | `unknown` |
 | `timeout` | the operation deadline elapsed | `unknown` |
 | `unrecognized_result` | unexpected result shape from the driver | omitted |
 | `mutation_rolled_back` | more than 100 rows would change | `rolled_back` |
 
-`retryable` is `true` only for a busy server that ran nothing. `mutation_outcome: unknown` means the statement may have reached SQL Server: read the database state before retrying. An unknown tool name stays a JSON-RPC `-32601` error with `data.code: "unknown_tool"`.
+`retryable` is `true` only for a busy server that ran nothing. `mutation_outcome` is present only when the server can describe it: `unknown` means a connection loss or timeout may have reached SQL Server, so read the database state before retrying. When SQL Server itself rejects the statement, the outcome is omitted for reads and raw batches and is `rolled_back` once a generated mutation's transaction is confirmed closed. An unknown tool name stays a JSON-RPC `-32601` error with `data.code: "unknown_tool"`.
 
 ## License
 
