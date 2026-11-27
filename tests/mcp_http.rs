@@ -9,7 +9,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 
 mod support;
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -849,6 +849,33 @@ fn send(addr: SocketAddr, outgoing: Outgoing) -> Response {
     );
 }
 
+/// A connection the daemon reset before the first response byte is the same
+/// transient condition as one closed while accepting. Reporting it with a
+/// generic error kind used to bypass [`is_transient`] and fail the test
+/// outright instead of retrying a fresh connection.
+#[test]
+fn a_reset_before_a_response_stays_retryable() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a resetting listener");
+    let addr = listener.local_addr().expect("listener address");
+    let resetter = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept one request");
+        let mut arrived = [0; 1];
+        // Leave the request unread so closing sends RST, exactly as a server
+        // that rejects a request before reading its body does.
+        stream.peek(&mut arrived).expect("wait for the request");
+        drop(stream);
+    });
+
+    let error = attempt(addr, &authorized(tools_call(1, "list_tables")))
+        .err()
+        .expect("a reset connection yields no response");
+    assert!(
+        is_transient(&error),
+        "a reset before a response must stay retryable: {error}"
+    );
+    resetter.join().expect("resetter");
+}
+
 /// A fresh connection that the daemon closed while starting or accepting is a
 /// transient harness condition; a real HTTP failure still returns a response.
 fn is_transient(error: &io::Error) -> bool {
@@ -888,7 +915,11 @@ fn attempt(addr: SocketAddr, outgoing: &Outgoing) -> io::Result<Response> {
         stream.write_all(head.as_bytes())?;
         stream.flush()?;
     }
-    let pending = thread::spawn(move || read_response(&mut reader));
+    let pending = thread::spawn(move || {
+        let mut received = 0;
+        let response = read_response(&mut reader, &mut received);
+        (received, response)
+    });
     let written = if outgoing.chunked {
         write_body(&mut stream, &outgoing.body, true)
     } else {
@@ -898,14 +929,24 @@ fn attempt(addr: SocketAddr, outgoing: &Outgoing) -> io::Result<Response> {
         stream.flush()
     };
     match pending.join().expect("response reader") {
-        Ok(response) => Ok(response),
-        Err(error) => {
+        (_, Ok(response)) => Ok(response),
+        (received, Err(error)) => {
             if let Err(write_error) = &written {
                 return Err(io::Error::new(write_error.kind(), write_error.to_string()));
             }
-            Err(io::Error::other(format!(
-                "no response after writing {written:?}: {error}"
-            )))
+            // A reset before the first response byte is the daemon closing a
+            // fresh connection, the same condition is_transient already
+            // tolerates while connecting or writing. A response that started
+            // and then broke is a real failure, so it must not be retried.
+            let kind = if received > 0 && is_transient(&error) {
+                io::ErrorKind::UnexpectedEof
+            } else {
+                error.kind()
+            };
+            Err(io::Error::new(
+                kind,
+                format!("no response after writing {written:?}: {error}"),
+            ))
         }
     }
 }
@@ -924,10 +965,11 @@ fn write_body(stream: &mut TcpStream, body: &[u8], chunked: bool) -> io::Result<
     stream.flush()
 }
 
-fn read_response(stream: &mut TcpStream) -> io::Result<Response> {
+fn read_response(stream: &mut TcpStream, received: &mut usize) -> io::Result<Response> {
     let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
     reader.read_line(&mut status_line)?;
+    *received += status_line.len();
     if status_line.trim().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -951,6 +993,7 @@ fn read_response(stream: &mut TcpStream) -> io::Result<Response> {
         if reader.read_line(&mut line)? == 0 {
             break;
         }
+        *received += line.len();
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
             break;
@@ -977,6 +1020,7 @@ fn read_response(stream: &mut TcpStream) -> io::Result<Response> {
         reader.read_to_end(&mut body)?;
         body
     };
+    *received += body.len();
     Ok(Response {
         status,
         headers,
