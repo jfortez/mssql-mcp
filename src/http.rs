@@ -11,7 +11,10 @@
 //! a locally bound daemon, not OAuth. The rmcp session is disabled, so each
 //! request is served statelessly, and the rmcp Host and Origin validation stays
 //! enabled: a supplied untrusted `Host` or any supplied `Origin` is refused
-//! because the transport is not a browser CORS endpoint.
+//! because the transport is not a browser CORS endpoint. The transport is also
+//! stateless, so it never offers the native approval prompt: `--trust-elicitation`
+//! is rejected at configuration time for HTTP and mutations fail closed without
+//! the explicit `--yolo` bypass.
 
 use std::io;
 use std::net::SocketAddr;
@@ -35,12 +38,12 @@ use crate::server::McpServer;
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const UNAUTHORIZED_BODY: &str = r#"{"code":"unauthorized","message":"send exactly one Authorization: Bearer header with the configured token"}"#;
 
-pub async fn run(mut settings: Settings) -> Result<(), String> {
+pub async fn run(mut settings: Settings, trust_elicitation: bool) -> Result<(), String> {
     let listen = settings.http_listen;
     let Some(token) = settings.token.take() else {
         return Err("MSSQL_MCP_TOKEN is required for the HTTP transport".to_owned());
     };
-    let server = Arc::new(McpServer::new(settings).map_err(str::to_owned)?);
+    let server = Arc::new(McpServer::new(settings, trust_elicitation).map_err(str::to_owned)?);
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(NeverSessionManager::default()),

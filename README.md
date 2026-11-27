@@ -24,6 +24,7 @@ Use flags or environment variables. Secrets are environment-only.
 | `MSSQL_PORT` | `--port` | 1–65535; the instance's TCP port | `1433` |
 | `MSSQL_MODE` | `--mode` | `read`, `write`, `both` | `read` |
 | `MSSQL_MCP_YOLO` | `--yolo` | `true` skips the mutation approval prompt (dangerous) | `false` |
+| — | `--trust-elicitation` | stdio only: trust the installed host to reserve the native MCP form prompt for a human | off |
 | `MSSQL_MCP_TRANSPORT` | `--transport` | `stdio`, `http` | `stdio` |
 | `MSSQL_MCP_HTTP_LISTEN` | `--http-listen` | `IP:port` | `127.0.0.1:8765` |
 | `MSSQL_MCP_TOKEN` | — | 32–128 of `A–Z a–z 0–9 - _`; HTTP only | required for `http` |
@@ -34,7 +35,7 @@ Use flags or environment variables. Secrets are environment-only.
 
 **TLS.** Use the hostname in the server certificate. The server verifies certificates against the system trust store by default.
 
-**Access.** `read` exposes the read tools; `write` exposes `insert_row`, `update_rows`, `delete_rows`, `query`, and `explore_schema`; `both` exposes all 15. Updates and deletes require filters and roll back above 100 rows. Mutations and `query` require human approval before connecting unless `--yolo` is set. The bypass is audited. Grant the login only the SQL Server permissions it needs.
+**Access.** `read` exposes the read tools; `write` exposes `insert_row`, `update_rows`, `delete_rows`, `query`, and `explore_schema`; `both` exposes all 15. Updates and deletes require filters and roll back above 100 rows. Mutations and `query` require a human approval that the server obtains itself, before connecting. By default no approval channel is trusted, so they fail closed with `approval_unavailable`; on stdio, `--trust-elicitation` opts into the native form prompt for an installed host that reserves it for a human, and HTTP never offers it. `--yolo` skips the question and is audited. An approval is never a tool argument. Grant the login only the SQL Server permissions it needs.
 
 Validate without connecting: `mssql-mcp --check-config`. All flags: `mssql-mcp --help`.
 
@@ -53,7 +54,7 @@ mssql-mcp --transport http
 
 Send `Authorization: Bearer $MSSQL_MCP_TOKEN` with every request to `http://127.0.0.1:8765/mcp`. Keep the endpoint on loopback: foreign `Host` and `Origin` headers are rejected. Do not add CORS or a reverse proxy.
 
-Clients share one SQL identity, mode, and four concurrent database slots. Each tool call opens its own SQL connection. Use another port for a different identity or mode. HTTP uses the [approval relay](#approving-a-mutation-without-elicitation).
+Clients share one SQL identity, mode, and four concurrent database slots. Each tool call opens its own SQL connection. Use another port for a different identity or mode. HTTP is stateless and never offers the native approval prompt, so HTTP mutations require the explicit `--yolo` bypass; see [human approval for mutations](#human-approval-for-mutations).
 
 ### Native, one client over stdio
 
@@ -169,10 +170,10 @@ Use the HTTP daemon if the ACP host's agent or adapter supports Streamable HTTP 
 | `list_tables` | `schema?`, `offset?` | `schema`, `name`, `type`, `object_id` per table or view, 100 per page |
 | `describe_table` | `table`, `offset?` | Column name, declared and base types, maximum length, precision, scale, nullability and ordinal |
 | `select_rows` | `table`, `columns`, `filters?`, `order_by?`, `limit?`, `offset?` | `columns`, `rows`, `truncated` |
-| `insert_row` | `table`, `values`, `approval_token?`, `approval_decision?` | `affected_rows`, or `approval_required` |
-| `update_rows` | `table`, `values`, `filters`, `approval_token?`, `approval_decision?` | `affected_rows`, or `approval_required` |
-| `delete_rows` | `table`, `filters`, `approval_token?`, `approval_decision?` | `affected_rows`, or `approval_required` |
-| `query` | `sql`, `limit?`, `approval_token?`, `approval_decision?` | `columns`, `rows`, `truncated` for one result set, `executed`, or `approval_required` |
+| `insert_row` | `table`, `values` | `affected_rows`, or `approval_unavailable` |
+| `update_rows` | `table`, `values`, `filters` | `affected_rows`, or `approval_unavailable` |
+| `delete_rows` | `table`, `filters` | `affected_rows`, or `approval_unavailable` |
+| `query` | `sql`, `limit?` | `columns`, `rows`, `truncated` for one result set, `executed`, or `approval_unavailable` |
 | `explore_schema` | `schema?`, `include?`, `definition?` | `tree`, `truncated` |
 | `schema_map` | `schema?`, `include?`, `table?`, `offset?`, `limit?` | Paged `entries`: schemas, objects, columns, keys, indexes and routine parameters |
 | `object_dependencies` | `object`, `offset?`, `limit?` | Paged `edges` from SQL expressions and foreign keys, incoming and outgoing |
@@ -196,15 +197,29 @@ Use the HTTP daemon if the ACP host's agent or adapter supports Streamable HTTP 
 
 Check the database before retrying a failed batch: earlier statements may have committed.
 
-## Approving a mutation without elicitation
+## Human approval for mutations
 
-Clients that advertise elicitation get a direct prompt. Other clients, including HTTP clients, relay the question:
+Mutations and `query` run only after a human approval the server obtains itself. **By default no approval channel is trusted**, so these tools refuse before opening a connection with `code: approval_unavailable` and `mutation_outcome: not_attempted`. The refusal offers no token and no decision argument: an approval is never a tool argument, so the model cannot answer its own question.
 
-1. Read `approval_required`. It is not an error, and `mutation_outcome: not_attempted` means SQL Server was not contacted.
-2. Show `approval_message` to the human: target and columns for a table mutation, or the exact SQL for `query`. Text-only clients can use `content[0].text`.
-3. Repeat the same call with `approval_token` and `approval_decision`: `grant` runs it once; `deny` refuses it. Both spend the token.
+### Trusting the native prompt on stdio
 
-The reply includes `approval_token_id` for correlation, `row_cap` (`100`, or `null` for `query`), and `expires_in_seconds` (`120`). A retry must use a known, unexpired, unused token for the same tool and byte-identical statement. Rejected tokens never reach SQL Server; see [error codes](#audit-and-errors).
+`--trust-elicitation` opts in, and only for the stdio transport. The server then sends a native MCP form elicitation for each prepared operation: a table mutation names the tool, target and columns; `query` shows the exact batch. The call runs only when all of these hold:
+
+1. The operator started a stdio server with `--trust-elicitation`.
+2. The client advertised native form elicitation.
+3. The human answered that prompt with an explicit confirmation.
+
+Declining, cancelling, an empty answer, a timeout or a transport failure refuses with `approval_denied` or `approval_unavailable`; nothing reaches SQL Server. A capability advertisement alone is not authorization: without the flag the server neither prompts nor connects.
+
+The protocol cannot attest that a host handed its prompt to a human; a host can advertise elicitation and answer its own question. Only enable this flag for an installed host that isolates that confirmation from the model, never for a host the model can drive.
+
+### HTTP
+
+The HTTP transport is stateless: there is no per-client connection to prompt, so it never offers native approval. The `--transport http --trust-elicitation` combination is rejected at configuration time. HTTP mutations require the explicit `--yolo` bypass.
+
+### Explicit bypass
+
+`--yolo` (or `MSSQL_MCP_YOLO=true`) skips the approval question and is audited as `yolo`. It never widens `read`: a read-mode process lists no mutation tool and refuses it before the gate. Use it only for a disposable or otherwise protected database.
 
 ## Reading the catalog
 
@@ -237,7 +252,7 @@ JSON Lines on stderr, stdout reserved for MCP. One `tool_call` record per handle
 ```
 
 - **Tool calls:** Record tool, mode, status, error code, duration, validated `scope`, and bounded counters (`rows`, `affected_rows`, `truncated`). `query` has no validated `scope`.
-- **Approval:** Mutations and `query` reaching the approval gate record `approval` as `yolo`, `granted`, `denied`, `required`, or `unavailable`. `approval_token_id` links a relay question to its answer without logging the token. Read tools omit both fields.
+- **Approval:** Mutations and `query` reaching the approval gate record `approval` as `yolo`, `granted`, `denied`, or `unavailable`. Read tools omit the field.
 - **Privacy:** Logs omit SQL text, values, credentials, host names, result rows, and raw driver messages. Validated schema and table names can appear. Capture the log with your client or supervisor; it is not tamper-proof.
 
 Tool errors return `isError`, readable `content[0].text`, and `structuredContent` with `code`, `message`, `action`, `retryable`, and `mutation_outcome` when known. SQL Server rejections include `sql_error: {number, severity, message}`. Sensitive diagnostics and error text are not relayed.
@@ -249,13 +264,8 @@ Tool errors return `isError`, readable `content[0].text`, and `structuredContent
 | `invalid_input` | a validated field was rejected | `not_attempted` |
 | `object_not_found` | a requested catalog object is missing or not visible | omitted |
 | `definition_unavailable` | `sys.sql_modules.definition` is NULL, or the login lacks `VIEW DEFINITION` | omitted |
-| `approval_denied` | the human declined or cancelled, or the approval prompt timed out | `not_attempted` |
-| `approval_unavailable` | the client advertised elicitation but the prompt could not be delivered | `not_attempted` |
-| `approval_token_unknown` | `approval_token` does not name a pending question | `not_attempted` |
-| `approval_token_expired` | the question was answered after its 120 seconds | `not_attempted` |
-| `approval_token_reused` | the token was already answered, granted or denied | `not_attempted` |
-| `approval_token_mismatch` | the retry rebuilds a different tool or statement | `not_attempted` |
-| `approval_token_invalid` | `approval_token` and `approval_decision` were not supplied together | `not_attempted` |
+| `approval_denied` | the human declined or cancelled, the prompt timed out, or the answer was not an explicit confirmation | `not_attempted` |
+| `approval_unavailable` | no trusted human approval channel is available: the default, the HTTP transport, a missing form capability, or a failed prompt | `not_attempted` |
 | `database_busy` | four operations already active | `not_attempted` |
 | `connection_failed` | TCP, TLS or login failed before any statement | `not_attempted` |
 | `authentication_unavailable` | mode missing from this build or platform | `not_attempted` |
@@ -275,4 +285,4 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 - **Explore data:** `explore_schema` → `describe_table` → `sample_rows` or a sorted `select_rows`. Use `search_objects` for partial names and `schema_map` for the full catalog.
 - **Trace a routine:** `routine_definition` → `object_dependencies` → `dependency_columns`. Use a `column_hint` such as `CreadoEn` to find matching columns on referenced objects.
-- **Run raw SQL:** Use `query` only when structured tools cannot express the operation. It requires human approval unless `--yolo` is set.
+- **Run raw SQL:** Use `query` only when structured tools cannot express the operation. It requires a trusted human approval or the explicit `--yolo` bypass.

@@ -362,6 +362,67 @@ fn help_documents_the_yolo_opt_out() {
 }
 
 #[test]
+fn trust_elicitation_is_stdio_only_and_documented() {
+    let valid = b"Configuration valid (auth=sql, mode=read)\n";
+    let baseline = run(&[CONNECTION, &["--check-config"]].concat(), &sql_env(None));
+    assert_eq!(baseline.status.code(), Some(0));
+    assert_eq!(baseline.stdout, valid);
+
+    // The trusted channel is opt-in and never changes the validation report.
+    for mode in ["read", "write", "both"] {
+        let expected = format!("Configuration valid (auth=sql, mode={mode})\n");
+        let with_trust = run(
+            &[
+                CONNECTION,
+                &["--mode", mode, "--trust-elicitation", "--check-config"],
+            ]
+            .concat(),
+            &sql_env(None),
+        );
+        let without_trust = run(
+            &[CONNECTION, &["--mode", mode, "--check-config"]].concat(),
+            &sql_env(None),
+        );
+        assert_eq!(with_trust.status.code(), Some(0), "{mode} mode");
+        assert_eq!(with_trust.stdout, expected.as_bytes(), "{mode} mode");
+        assert_eq!(with_trust.stdout, without_trust.stdout, "{mode} mode");
+        assert!(with_trust.stderr.is_empty(), "{mode} mode");
+    }
+
+    // A stateless HTTP daemon cannot prompt a human, so the combination is
+    // rejected instead of being silently ignored or left as a false promise.
+    let out = run(
+        &[
+            CONNECTION,
+            &[
+                "--transport",
+                "http",
+                "--trust-elicitation",
+                "--check-config",
+            ],
+        ]
+        .concat(),
+        &sql_env(Some(TOKEN)),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        out.stderr,
+        b"Configuration error: --trust-elicitation requires the stdio transport; the HTTP transport is stateless and cannot prompt a human\n"
+    );
+
+    let help = run(&["--help"], &[]);
+    assert_eq!(help.status.code(), Some(0));
+    let help = String::from_utf8(help.stdout).expect("help output is UTF-8");
+    for expected in ["--trust-elicitation", "stdio", "cannot attest"] {
+        assert!(
+            help.contains(expected),
+            "help must document {expected:?}: {help}"
+        );
+    }
+}
+
+#[test]
 fn help_documents_detection_instead_of_a_sql_default() {
     let out = run(&["--help"], &[]);
     assert_eq!(out.status.code(), Some(0));

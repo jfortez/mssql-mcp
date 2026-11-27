@@ -358,46 +358,41 @@ fn write_connection_failure_is_audited_as_not_attempted() {
 }
 
 #[test]
-fn a_relayed_mutation_audits_its_question_and_answer_and_reads_have_no_approval() {
+fn a_refused_mutation_is_audited_as_unavailable_and_reads_have_no_approval() {
     let (port, _peer) = support::dropping_peer();
     let mut server = Server::start_with("both", port, false);
     let statement = json!({"table": {"name": "Items"}, "filters": {"id": 1}});
 
-    // The first call asks and records the question, not a decision.
-    let response = server.call_tool("delete_rows", statement.clone());
-    assert_eq!(
-        response["isError"], false,
-        "a question is not an error: {response}"
+    // Without a trusted prompt the mutation is refused as an error, and the
+    // dropping peer proves the database layer was never reached: a connection
+    // attempt would have produced connection_failed instead.
+    let response = server.call_tool("delete_rows", statement);
+    let error = error_of(&response);
+    assert_eq!(error["code"], "approval_unavailable", "{response}");
+    assert_eq!(error["mutation_outcome"], "not_attempted", "{response}");
+    assert_eq!(error["retryable"], false, "{response}");
+    assert!(
+        !response.to_string().contains("approval_token"),
+        "a refusal must not offer a model-callable answer: {response}"
     );
-    let question = &response["structuredContent"];
-    assert_eq!(question["code"], "approval_required", "{response}");
-    assert_eq!(question["mutation_outcome"], "not_attempted", "{response}");
-    let token = question["approval_token"]
-        .as_str()
-        .expect("a question carries a token");
-    let token_id = question["approval_token_id"]
-        .as_str()
-        .expect("a question carries its token label");
-    assert_eq!(token_id, &token[..8]);
 
     let record = server.next_audit();
     assert_eq!(record.json["event"], "tool_call", "{}", record.raw);
     assert_eq!(record.json["tool"], "delete_rows", "{}", record.raw);
-    assert_eq!(record.json["status"], "ok", "{}", record.raw);
-    assert_eq!(record.json["approval"], "required", "{}", record.raw);
+    assert_eq!(record.json["status"], "error", "{}", record.raw);
     assert_eq!(
-        record.json["approval_token_id"],
-        json!(token_id),
+        record.json["code"], "approval_unavailable",
         "{}",
         record.raw
     );
+    assert_eq!(record.json["approval"], "unavailable", "{}", record.raw);
     assert_eq!(
         record.json["scope"],
         json!({"schema": "dbo", "table": "Items"}),
         "{}",
         record.raw
     );
-    for absent in ["rows", "affected_rows", "truncated", "code"] {
+    for absent in ["rows", "affected_rows", "truncated", "approval_token_id"] {
         assert!(
             record.json.get(absent).is_none(),
             "unexpected {absent} in {}",
@@ -411,25 +406,6 @@ fn a_relayed_mutation_audits_its_question_and_answer_and_reads_have_no_approval(
             record.raw
         );
     }
-
-    // The answer is recorded as granted with the same label, and only now does
-    // the statement reach the database layer, whose peer drops the connection.
-    let mut retry = statement;
-    retry["approval_token"] = json!(token);
-    retry["approval_decision"] = json!("grant");
-    let response = server.call_tool("delete_rows", retry);
-    let error = error_of(&response);
-    assert_eq!(error["code"], "connection_failed", "{response}");
-    assert_eq!(error["mutation_outcome"], "not_attempted", "{response}");
-    let record = server.next_audit();
-    assert_eq!(record.json["approval"], "granted", "{}", record.raw);
-    assert_eq!(
-        record.json["approval_token_id"],
-        json!(token_id),
-        "{}",
-        record.raw
-    );
-    assert_eq!(record.json["code"], "connection_failed", "{}", record.raw);
 
     let response = server.call_tool(
         "select_rows",
