@@ -27,6 +27,25 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Read the manifest version
+        id: version
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not read the version from Cargo.toml."
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION"
+
+      - name: Require the reviewed release notes
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          RELEASE_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python3 -B .github/scripts/release_pr.py notes "$VERSION" "$RELEASE_REF" "$DEFAULT_BRANCH"
+
       - name: Require the registry token
         if: ${{ !inputs.dry_run }}
         env:
@@ -48,17 +67,6 @@ jobs:
 
       - name: Run Clippy
         run: cargo +stable clippy --locked --all-targets -- -D warnings
-
-      - name: Read the manifest version
-        id: version
-        run: |
-          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
-          if [ -z "$VERSION" ]; then
-            echo "::error::Could not read the version from Cargo.toml."
-            exit 1
-          fi
-          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Releasing $VERSION"
 
       - name: Refuse an existing tag
         if: ${{ !inputs.dry_run }}
@@ -102,4 +110,4 @@ jobs:
           gh release create "$TAG" \
             --verify-tag \
             --title "$TAG" \
-            --generate-notes
+            --notes-file "releases/v$VERSION.md"
