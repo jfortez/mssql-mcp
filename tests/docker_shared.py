@@ -40,9 +40,12 @@ def verify_client(token, name):
     })
     assert initialize["serverInfo"]["name"] == "mssql-mcp"
     tools = post("tools/list", 2, {})["tools"]
+    # Mirrors Mode::Read in src/server.rs: the read surface exposes every read
+    # tool and no mutation.
     assert {tool["name"] for tool in tools} == {
         "list_tables", "describe_table", "select_rows", "explore_schema", "schema_map",
-        "object_dependencies", "search_objects", "table_stats", "sample_rows",
+        "object_dependencies", "routine_definition", "dependency_columns",
+        "search_objects", "table_stats", "sample_rows",
     }
     result = post("tools/call", 3, {
         "name": "select_rows", "arguments": {
