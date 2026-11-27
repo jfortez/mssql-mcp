@@ -267,20 +267,6 @@ Tool errors return `isError`, readable `content[0].text`, and `structuredContent
 
 Only `database_busy` is `retryable`. If `mutation_outcome` is `unknown`, check the database before retrying. An unknown tool returns JSON-RPC `-32601` with `data.code: "unknown_tool"`.
 
-## Maintainer releases
-
-Preparation and publishing are separate manual workflows; merging never publishes.
-
-1. Once per repository, open **Settings → Actions → General** and enable **Allow GitHub Actions to create and approve pull requests**. Preparation uses only the built-in `GITHUB_TOKEN`, so it needs no personal access token and no crates.io secret.
-2. Run **Actions → Prepare release**. Leave `version` empty for the bootstrap release, which uses the version already in `Cargo.toml` (`0.1.0`). Later releases select the new version explicitly, for example `0.2.0`; nothing increments it automatically. The run writes `releases/v<version>.md` from the Git history since the previous release tag, bumps `Cargo.toml` and `Cargo.lock` only when a new version is selected, runs formatting, tests, Clippy and `cargo package`, and opens one pull request from `release/v<version>`. It never publishes, tags, or approves anything.
-3. Review the notes and the diff, then merge the pull request. CI on a pull request opened by `GITHUB_TOKEN` may wait for a maintainer to click **Approve workflows to run**; GitHub never approves it automatically, so approve it from the pull request checks. Merging does not tag or publish anything.
-4. Run **Actions → Release** with `dry_run` enabled. No token, upload, or tag.
-5. Set the `CARGO_REGISTRY_TOKEN` secret and run **Release** again with `dry_run` disabled. It requires the reviewed notes on the default branch, rejects an existing remote `v<version>`, publishes, then pushes an annotated `v<version>` on the published commit and creates the GitHub Release from `releases/v<version>.md`.
-
-If preparation fails after pushing `release/v<version>` but before opening the pull request, rerun **Prepare release**. It reuses that branch only when its commit has the prepared files and the current default-branch commit as its parent; any other difference fails without overwriting the branch.
-
-If tagging or release creation fails after upload, use the run's commit SHA to restore the missing tag or release. Verify any existing tag without moving it. Don't republish the same version.
-
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
