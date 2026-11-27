@@ -200,6 +200,36 @@ impl Server {
             .collect()
     }
 
+    /// The record of the `occurrence`-th completed call of `tool`. A test that
+    /// calls the same tool repeatedly must name which record it means: waiting
+    /// only for "a record" can return the previous call's line while the newest
+    /// one is still being written.
+    fn audit_record_after(&self, tool: &str, occurrence: usize) -> Value {
+        let needle = format!("\"tool\":\"{tool}\"");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let found = {
+                let lines = self.audit.lock().expect("audit lines");
+                lines
+                    .iter()
+                    .filter(|line| {
+                        line.contains("\"event\":\"tool_call\"") && line.contains(&needle)
+                    })
+                    .nth(occurrence - 1)
+                    .cloned()
+            };
+            if let Some(line) = found {
+                return serde_json::from_str(&line).expect("audit record is JSON");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fewer than {occurrence} tool_call audit records for {tool}: {:?}",
+                self.audit.lock().expect("audit lines")
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn audit_record(&self, tool: &str) -> Value {
         let needle = format!("\"tool\":\"{tool}\"");
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -277,11 +307,14 @@ fn explore_schema_is_listed_in_every_mode() {
 fn closed_database_returns_a_sanitized_error_without_approval() {
     let (port, _peer) = support::dropping_peer();
     let mut server = Server::start("read", port, true);
-    for arguments in [
+    for (index, arguments) in [
         json!({}),
         json!({"schema": "dbo", "include": ["tables"]}),
         json!({"definition": true}),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let result = server.call_tool("explore_schema", arguments.clone());
         let text = error_text(&result);
         assert_eq!(text, "database operation failed", "{arguments}: {result}");
@@ -301,7 +334,7 @@ fn closed_database_returns_a_sanitized_error_without_approval() {
                 "{arguments}: the error leaked {leaked:?}: {reply}"
             );
         }
-        let record = server.audit_record("explore_schema");
+        let record = server.audit_record_after("explore_schema", index + 1);
         assert!(
             record.get("approval").is_none(),
             "explore_schema must not carry an approval outcome: {record}"
