@@ -203,7 +203,7 @@ Mutations and `query` run only after a human approval the server obtains itself.
 
 ### Trusting the native prompt on stdio
 
-`--trust-elicitation` opts in, and only for the stdio transport. The server then sends a native MCP form elicitation for each prepared operation: a table mutation names the tool, target and columns; `query` shows the exact batch. The call runs only when all of these hold:
+`--trust-elicitation` opts in, and only for the stdio transport. The server then sends a native MCP form elicitation for each prepared operation: a table mutation names the tool, the escaped target schema and table, the exact JSON-typed values it writes and the exact equality-filter values it matches (filters are joined with `AND`, and JSON null means SQL NULL); `query` shows the exact batch. The installed host must display that form to the human and keep it out of logs, transcripts visible to the model, and tool results; the server never copies values or filters into audit lines or error messages. The call runs only when all of these hold:
 
 1. The operator started a stdio server with `--trust-elicitation`.
 2. The client advertised native form elicitation.
