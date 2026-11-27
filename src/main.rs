@@ -28,8 +28,8 @@ async fn main() -> ExitCode {
             }
         };
     }
-    let settings = match cli.settings() {
-        Ok(settings) => settings,
+    let (settings, trust_elicitation) = match cli.settings() {
+        Ok(configuration) => configuration,
         Err(error) => {
             eprintln!("Configuration error: {error}");
             return ExitCode::from(2);
@@ -43,7 +43,7 @@ async fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    match mssql_mcp::server::serve(settings).await {
+    match mssql_mcp::server::serve(settings, trust_elicitation).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("MCP server error: {error}");

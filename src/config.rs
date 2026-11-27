@@ -112,6 +112,13 @@ pub struct Cli {
     #[arg(long, env = "MSSQL_MCP_YOLO")]
     yolo: bool,
 
+    /// Trust this installed stdio host to reserve the native MCP form prompt
+    /// for a human on every mutation. The protocol cannot attest that the host
+    /// does so, so only enable it for a host that isolates the confirmation
+    /// from the model. Forbidden with the HTTP transport.
+    #[arg(long)]
+    trust_elicitation: bool,
+
     /// Validate configuration without connecting to SQL Server.
     #[arg(long)]
     check_config: bool,
@@ -165,7 +172,10 @@ pub struct Settings {
 }
 
 impl Cli {
-    pub fn settings(self) -> Result<Settings, &'static str> {
+    /// Connection settings plus the operator's trusted-channel choice. The
+    /// trust promise is not part of the SQL connection configuration, so it is
+    /// returned beside it instead of being stored there.
+    pub fn settings(self) -> Result<(Settings, bool), &'static str> {
         let mut settings = self.connection.settings()?;
         settings.mode = self.mode;
         settings.transport = self.transport;
@@ -176,7 +186,12 @@ impl Cli {
         };
         settings.yolo = self.yolo;
         settings.check_config = self.check_config;
-        Ok(settings)
+        let trust_elicitation = match (self.transport, self.trust_elicitation) {
+            (Transport::Http, true) => return Err(TRUST_WITH_HTTP),
+            (Transport::Http, false) => false,
+            (Transport::Stdio, trust_elicitation) => trust_elicitation,
+        };
+        Ok((settings, trust_elicitation))
     }
 }
 
@@ -233,6 +248,7 @@ const NTLM_UNQUALIFIED_USER: &str =
     "NTLM requires the domain in MSSQL_USER as DOMAIN\\user, not only the user name";
 const USER_WITH_EMPTY_PART: &str =
     "MSSQL_USER must be DOMAIN\\user with a non-empty domain and user";
+const TRUST_WITH_HTTP: &str = "--trust-elicitation requires the stdio transport; the HTTP transport is stateless and cannot prompt a human";
 
 /// Detection recognizes `DOMAIN\user` and nothing else: tiberius and sspi-rs
 /// take exactly that spelling, so a UPN would claim support the driver does not

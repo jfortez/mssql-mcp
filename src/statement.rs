@@ -4,8 +4,6 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::approval::ApprovalDecision;
-
 const DEFAULT_LIMIT: u16 = 25;
 pub(crate) const MAX_ROWS: u16 = 100;
 const MAX_ENTRIES: usize = 16;
@@ -372,14 +370,6 @@ pub struct InsertRow {
     /// Column values to insert, 1–16 entries. SQL Server can implicitly convert numbers to text; use JSON strings to specify the exact text.
     #[schemars(length(max = 16))]
     pub values: BTreeMap<String, Value>,
-    /// One-shot token from an `approval_required` result; omit it on the first
-    /// call, which asks the question instead of running anything.
-    #[serde(default)]
-    pub approval_token: Option<String>,
-    /// Answer relayed on the human's behalf: `grant` runs the statement once,
-    /// `deny` refuses it. Required together with `approval_token`.
-    #[serde(default)]
-    pub approval_decision: Option<ApprovalDecision>,
 }
 
 impl InsertRow {
@@ -414,14 +404,6 @@ pub struct UpdateRows {
     /// Equality filters combined with AND; at least one is required.
     #[serde(default)]
     pub filters: BTreeMap<String, Value>,
-    /// One-shot token from an `approval_required` result; omit it on the first
-    /// call, which asks the question instead of running anything.
-    #[serde(default)]
-    pub approval_token: Option<String>,
-    /// Answer relayed on the human's behalf: `grant` runs the statement once,
-    /// `deny` refuses it. Required together with `approval_token`.
-    #[serde(default)]
-    pub approval_decision: Option<ApprovalDecision>,
 }
 
 impl UpdateRows {
@@ -455,14 +437,6 @@ pub struct DeleteRows {
     /// Equality filters combined with AND; at least one is required.
     #[serde(default)]
     pub filters: BTreeMap<String, Value>,
-    /// One-shot token from an `approval_required` result; omit it on the first
-    /// call, which asks the question instead of running anything.
-    #[serde(default)]
-    pub approval_token: Option<String>,
-    /// Answer relayed on the human's behalf: `grant` runs the statement once,
-    /// `deny` refuses it. Required together with `approval_token`.
-    #[serde(default)]
-    pub approval_decision: Option<ApprovalDecision>,
 }
 
 impl DeleteRows {

@@ -69,7 +69,7 @@ struct Server {
 }
 
 impl Server {
-    fn start(mode: &str, port: u16, yolo: bool, elicitation: bool) -> Self {
+    fn start(mode: &str, port: u16, yolo: bool, elicitation: bool, trust: bool) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_mssql-mcp"));
         support::clear_env(&mut command)
             .env("MSSQL_USER", "sa")
@@ -91,6 +91,9 @@ impl Server {
             .stderr(Stdio::piped());
         if yolo {
             command.arg("--yolo");
+        }
+        if trust {
+            command.arg("--trust-elicitation");
         }
         let mut child = command.spawn().expect("spawn MCP server");
         let stdin = child.stdin.take().expect("server stdin");
@@ -330,72 +333,146 @@ fn error_text(result: &Value) -> &str {
         .unwrap_or_else(|| panic!("tool error without text: {result}"))
 }
 
-/// The relay question: a structured result, never an error.
-fn approval_question(result: &Value) -> &Value {
-    assert_eq!(
-        result["isError"], false,
-        "a question is not an error: {result}"
-    );
-    let payload = result
-        .get("structuredContent")
-        .filter(|payload| payload.is_object())
-        .unwrap_or_else(|| panic!("question without structured content: {result}"));
-    assert_eq!(payload["code"], "approval_required", "{result}");
-    payload
-}
-
-#[test]
-fn query_is_absent_from_read_mode_and_never_connects() {
-    let peer = CountingPeer::start();
-    let mut server = Server::start("read", peer.port, false, false);
-    assert!(
-        !server.tool_names().iter().any(|name| name == "query"),
-        "read mode must not list query"
-    );
-    let result = server.call_tool("query", json!({"sql": "SELECT 1"}));
-    let error = tool_error(&result);
-    assert_eq!(error["code"], "mode_unavailable", "{result}");
+/// The refusal of a mutation without a trusted human channel: an error that
+/// offers no model-callable answer.
+fn approval_unavailable(result: &Value) -> &Value {
+    let error = tool_error(result);
+    assert_eq!(error["code"], "approval_unavailable", "{result}");
     assert_eq!(error["mutation_outcome"], "not_attempted", "{result}");
     assert_eq!(error["retryable"], false, "{result}");
-    thread::sleep(CONNECTION_GRACE);
-    assert_eq!(peer.attempts(), 0, "a refused query must not connect");
-    assert!(
-        server.audit_record("query").get("approval").is_none(),
-        "a mode refusal must not claim an approval outcome"
-    );
+    let reply = result.to_string();
+    for relay in ["approval_token", "approval_decision", "approval_required"] {
+        assert!(
+            !reply.contains(relay),
+            "the model-facing relay leaked {relay:?}: {reply}"
+        );
+    }
+    error
 }
 
 #[test]
-fn query_without_approval_asks_before_connecting_in_write_and_both() {
-    for mode in ["write", "both"] {
+fn read_mode_never_exposes_or_connects_for_mutations_even_with_yolo() {
+    for yolo in [false, true] {
         let peer = CountingPeer::start();
-        let mut server = Server::start(mode, peer.port, false, false);
-        let sql = format!("SELECT '{SQL_MARKER}' AS [marker]");
-        let result = server.call_tool("query", json!({"sql": sql}));
-        let question = approval_question(&result);
-        assert_eq!(question["mutation_outcome"], "not_attempted", "{mode}");
-        assert_eq!(question["row_cap"], Value::Null, "{mode}: {result}");
-        assert_eq!(question["expires_in_seconds"], 120, "{mode}: {result}");
-        let token = question["approval_token"].as_str().expect("token");
-        assert_eq!(token.len(), 32, "{mode}: {token}");
-        assert_eq!(question["approval_token_id"], json!(&token[..8]), "{mode}");
-        let message = question["approval_message"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{mode}: no human message: {result}"));
-        assert!(
-            message.contains(&sql),
-            "{mode}: the question must carry the exact batch: {message}"
-        );
+        let mut server = Server::start("read", peer.port, yolo, false, false);
+        let tools = server.tool_names();
+        for (name, arguments) in [
+            ("query", json!({"sql": "SELECT 1"})),
+            (
+                "insert_row",
+                json!({"table": {"name": "Items"}, "values": {"id": 1}}),
+            ),
+            (
+                "update_rows",
+                json!({"table": {"name": "Items"}, "values": {"label": "x"}, "filters": {"id": 1}}),
+            ),
+            (
+                "delete_rows",
+                json!({"table": {"name": "Items"}, "filters": {"id": 1}}),
+            ),
+        ] {
+            assert!(
+                !tools.iter().any(|tool| tool == name),
+                "read must not list {name}"
+            );
+            let result = server.call_tool(name, arguments);
+            let error = tool_error(&result);
+            assert_eq!(error["code"], "mode_unavailable", "{name}: {result}");
+            assert_eq!(
+                error["mutation_outcome"], "not_attempted",
+                "{name}: {result}"
+            );
+            assert_eq!(error["retryable"], false, "{name}: {result}");
+            assert!(
+                server.audit_record(name).get("approval").is_none(),
+                "a mode refusal must not claim an approval outcome for {name}"
+            );
+        }
         thread::sleep(CONNECTION_GRACE);
         assert_eq!(
             peer.attempts(),
             0,
-            "{mode}: a query without an answer must not connect"
+            "read must not connect for a mutation (yolo={yolo})"
+        );
+    }
+}
+
+/// The incident scenario: an agent prepares ordinary CREATE, ALTER and DROP
+/// batches for a procedure that adds numbers. Without a trusted human answer
+/// none of them may reach SQL Server, and no model-callable relay may be
+/// offered as an alternative execution path.
+#[test]
+fn untrusted_ddl_never_connects() {
+    let ddl = [
+        "CREATE PROCEDURE dbo.usp_sum @a int, @b int AS SELECT @a + @b AS total",
+        "ALTER PROCEDURE dbo.usp_sum @a int, @b int, @c int AS SELECT @a + @b + @c AS total",
+        "DROP PROCEDURE dbo.usp_sum",
+    ];
+    for mode in ["write", "both"] {
+        let peer = CountingPeer::start();
+        let mut server = Server::start(mode, peer.port, false, false, false);
+        for sql in ddl {
+            let result = server.call_tool("query", json!({"sql": sql}));
+            let error = tool_error(&result);
+            assert_eq!(
+                error["code"], "approval_unavailable",
+                "{mode}: {sql}: {result}"
+            );
+            assert_eq!(
+                error["mutation_outcome"], "not_attempted",
+                "{mode}: {sql}: {result}"
+            );
+            assert_eq!(error["retryable"], false, "{mode}: {sql}: {result}");
+            assert!(
+                error["action"]
+                    .as_str()
+                    .is_some_and(|action| !action.is_empty()),
+                "{mode}: {sql}: a refusal without guidance: {result}"
+            );
+            let reply = result.to_string();
+            for relay in ["approval_token", "approval_decision", "approval_required"] {
+                assert!(
+                    !reply.contains(relay),
+                    "{mode}: {sql}: the model-facing relay leaked {relay:?}: {reply}"
+                );
+            }
+            assert_eq!(
+                server.audit_record("query")["approval"],
+                "unavailable",
+                "{mode}: {sql}"
+            );
+        }
+        thread::sleep(CONNECTION_GRACE);
+        assert_eq!(
+            peer.attempts(),
+            0,
+            "{mode}: an unapproved mutation must not reach SQL Server"
+        );
+    }
+}
+
+#[test]
+fn query_without_a_trusted_channel_is_refused_in_write_and_both() {
+    for mode in ["write", "both"] {
+        let peer = CountingPeer::start();
+        let mut server = Server::start(mode, peer.port, false, false, false);
+        let sql = format!("SELECT '{SQL_MARKER}' AS [marker]");
+        let result = server.call_tool("query", json!({"sql": sql}));
+        approval_unavailable(&result);
+        thread::sleep(CONNECTION_GRACE);
+        assert_eq!(
+            peer.attempts(),
+            0,
+            "{mode}: a query without a trusted answer must not connect"
         );
         let record = server.audit_record("query");
-        assert_eq!(record["approval"], "required", "{mode}: {record}");
-        assert_eq!(record["approval_token_id"], json!(&token[..8]), "{mode}");
-        assert_eq!(record["status"], "ok", "{mode}: {record}");
+        assert_eq!(record["approval"], "unavailable", "{mode}: {record}");
+        assert_eq!(record["code"], "approval_unavailable", "{mode}: {record}");
+        assert_eq!(record["status"], "error", "{mode}: {record}");
+        assert!(
+            record.get("approval_token_id").is_none(),
+            "{mode}: no relay label exists: {record}"
+        );
         let audit = server.audit_text();
         assert!(
             !audit.contains(SQL_MARKER) && !audit.contains("SELECT"),
@@ -405,88 +482,56 @@ fn query_without_approval_asks_before_connecting_in_write_and_both() {
 }
 
 #[test]
-fn the_relay_binds_the_exact_batch_and_runs_it_once() {
+fn an_advertised_capability_without_the_trust_flag_fails_closed() {
     let peer = CountingPeer::start();
-    let mut server = Server::start("write", peer.port, false, false);
-    let sql = format!("DELETE FROM dbo.Items WHERE [id] = 42; -- {SQL_MARKER}");
-    let result = server.call_tool("query", json!({"sql": sql}));
-    let token = approval_question(&result)["approval_token"]
-        .as_str()
-        .expect("token")
-        .to_owned();
-
-    // A different batch, down to one character, is never authorized.
-    for swapped in [
-        format!("{sql} "),
-        sql.replace("42", "43"),
-        "SELECT 1".to_owned(),
-    ] {
-        let refusal = server.call_tool(
-            "query",
-            json!({"sql": swapped, "approval_token": token, "approval_decision": "grant"}),
-        );
-        assert_eq!(
-            tool_error(&refusal)["code"],
-            "approval_token_mismatch",
-            "{swapped:?}: {refusal}"
-        );
-    }
-    assert_eq!(peer.attempts(), 0, "a swapped batch must not connect");
-
-    let mut retry = json!({"sql": sql});
-    retry["approval_token"] = json!(token);
-    retry["approval_decision"] = json!("grant");
-    let granted = server.call_tool("query", retry.clone());
-    assert_eq!(
-        tool_error(&granted)["code"],
-        "connection_failed",
-        "a granted retry must reach the database layer: {granted}"
-    );
-    assert_eq!(server.audit_record("query")["approval"], "granted");
-
-    let replay = server.call_tool("query", retry);
-    assert_eq!(
-        tool_error(&replay)["code"],
-        "approval_token_reused",
-        "{replay}"
-    );
+    let mut server = Server::start("both", peer.port, false, true, false);
+    // The response helper fails on any unsolicited server request, so this
+    // also proves the server did not ask the client to approve anything.
+    let result = server.call_tool("query", json!({"sql": "SELECT 1"}));
+    approval_unavailable(&result);
     thread::sleep(CONNECTION_GRACE);
-    assert_eq!(
-        peer.attempts(),
-        1,
-        "the replay must not open a second connection"
-    );
+    assert_eq!(peer.attempts(), 0, "a capability is not an approval");
+    assert_eq!(server.audit_record("query")["approval"], "unavailable");
 }
 
 #[test]
-fn denying_a_query_question_never_runs_the_batch() {
+fn relay_arguments_are_rejected_before_the_gate() {
     let peer = CountingPeer::start();
-    let mut server = Server::start("both", peer.port, false, false);
-    let sql = format!("DROP TABLE dbo.Items; -- {SQL_MARKER}");
-    let question = server.call_tool("query", json!({"sql": sql}));
-    let token = approval_question(&question)["approval_token"]
-        .as_str()
-        .expect("token");
-    let denied = server.call_tool(
-        "query",
-        json!({"sql": sql, "approval_token": token, "approval_decision": "deny"}),
-    );
-    assert_eq!(tool_error(&denied)["code"], "approval_denied", "{denied}");
-    assert_eq!(tool_error(&denied)["mutation_outcome"], "not_attempted");
+    let mut server = Server::start("write", peer.port, false, false, false);
+    for arguments in [
+        json!({
+            "sql": "DROP PROCEDURE dbo.usp_sum",
+            "approval_token": "0123456789abcdef0123456789abcdef",
+            "approval_decision": "grant",
+        }),
+        json!({"sql": "DROP PROCEDURE dbo.usp_sum", "approval_decision": "grant"}),
+        json!({"sql": "DROP PROCEDURE dbo.usp_sum", "approval_token": "0123456789abcdef"}),
+    ] {
+        let result = server.call_tool("query", arguments);
+        assert_eq!(
+            error_text(&result),
+            "invalid arguments for query",
+            "{result}"
+        );
+        assert_eq!(tool_error(&result)["code"], "invalid_arguments", "{result}");
+        assert_eq!(
+            tool_error(&result)["mutation_outcome"],
+            "not_attempted",
+            "{result}"
+        );
+    }
     thread::sleep(CONNECTION_GRACE);
-    assert_eq!(peer.attempts(), 0, "a denial must never connect");
-    assert_eq!(server.audit_record("query")["approval"], "denied");
-    let audit = server.audit_text();
-    assert!(
-        !audit.contains(SQL_MARKER) && !audit.contains("DROP"),
-        "the denial must not record the batch: {audit}"
+    assert_eq!(
+        peer.attempts(),
+        0,
+        "rejected relay arguments must not connect"
     );
 }
 
 #[test]
 fn declining_the_query_prompt_refuses_before_connecting() {
     let peer = CountingPeer::start();
-    let mut server = Server::start("write", peer.port, false, true);
+    let mut server = Server::start("write", peer.port, false, true, true);
     let id = server.begin_tool_call("query", json!({"sql": "SELECT 1"}));
     let request = server.await_elicitation();
     server.answer(&request, json!({"action": "decline"}));
@@ -508,7 +553,7 @@ fn declining_the_query_prompt_refuses_before_connecting() {
 fn yolo_forwards_the_batch_to_the_database_layer() {
     for mode in ["write", "both"] {
         let (port, _peer) = support::dropping_peer();
-        let mut server = Server::start(mode, port, true, false);
+        let mut server = Server::start(mode, port, true, false, false);
         let sql = format!("SELECT '{SQL_MARKER}' AS [marker]");
         let result = server.call_tool("query", json!({"sql": sql}));
         let error = tool_error(&result);
@@ -535,7 +580,7 @@ fn yolo_forwards_the_batch_to_the_database_layer() {
 #[test]
 fn the_prompt_carries_the_exact_batch_and_reaches_the_database_after_approval() {
     let (port, _peer) = support::dropping_peer();
-    let mut server = Server::start("write", port, false, true);
+    let mut server = Server::start("write", port, false, true, true);
     let sql = format!(
         "UPDATE dbo.Items SET [label] = '{SQL_MARKER}' WHERE [id] = 42;\nSELECT 1; -- trailing"
     );
@@ -586,7 +631,7 @@ fn the_prompt_carries_the_exact_batch_and_reaches_the_database_after_approval() 
 #[test]
 fn invalid_arguments_are_rejected_before_the_gate() {
     let peer = CountingPeer::start();
-    let mut server = Server::start("write", peer.port, false, true);
+    let mut server = Server::start("write", peer.port, false, true, true);
     for (arguments, message, code) in [
         (
             json!({"sql": "   "}),

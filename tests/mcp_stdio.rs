@@ -388,32 +388,26 @@ fn tools_expose_object_input_schemas() {
         64
     );
 
-    // Every mutation tool advertises the optional relay pair, spelled exactly
-    // `approval_token` and `approval_decision`, so a client without elicitation
-    // can find the answer arguments in the schema it already reads.
+    // Approval is never a model-callable argument: no mutation schema exposes
+    // a token or a decision, so there is no relay for a client to discover and
+    // a model cannot answer its own question.
     for name in ["insert_row", "update_rows", "delete_rows", "query"] {
         let tool = tools
             .iter()
             .find(|tool| tool["name"] == name)
             .unwrap_or_else(|| panic!("{name} present"));
-        let required = tool["inputSchema"]["required"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{name} required list"));
-        for optional in ["approval_token", "approval_decision"] {
+        let schema = &tool["inputSchema"];
+        let properties = &schema["properties"];
+        for relay in ["approval_token", "approval_decision"] {
             assert!(
-                !required.contains(&json!(optional)),
-                "{name}.{optional} must stay optional: {tool}"
+                !properties
+                    .as_object()
+                    .is_some_and(|properties| properties.contains_key(relay)),
+                "{name} must not advertise {relay}: {tool}"
             );
             assert!(
-                tool["inputSchema"]["properties"][optional].is_object(),
-                "{name} must describe {optional}: {tool}"
-            );
-        }
-        let decision = tool["inputSchema"]["properties"]["approval_decision"].to_string();
-        for value in ["grant", "deny"] {
-            assert!(
-                decision.contains(value),
-                "{name}.approval_decision must accept {value:?}: {decision}"
+                !schema.to_string().contains(relay),
+                "{name} schema must not describe a relay ({relay}): {tool}"
             );
         }
     }
@@ -444,6 +438,27 @@ fn tools_expose_object_input_schemas() {
         assert_eq!(annotations["idempotentHint"], idempotent, "{name}");
         assert_eq!(annotations["openWorldHint"], false, "{name}");
     }
+    server.close();
+}
+
+#[test]
+fn a_mutation_without_a_trusted_channel_is_refused_without_connecting() {
+    // Port 1 is a closed loopback port: a reached database layer would report
+    // connection_failed or timeout, so approval_unavailable proves the gate
+    // refused before connecting.
+    let mut server = McpServer::start("write", 1);
+    let result = server.call_tool(
+        "insert_row",
+        json!({"table": {"name": "Items"}, "values": {"id": 1}}),
+    );
+    let error = structured_error(&result);
+    assert_eq!(error["code"], "approval_unavailable", "{result}");
+    assert_eq!(error["mutation_outcome"], "not_attempted", "{result}");
+    assert_eq!(error["retryable"], false, "{result}");
+    assert!(
+        !result.to_string().contains("approval_token"),
+        "a refusal must not offer a model-callable answer: {result}"
+    );
     server.close();
 }
 

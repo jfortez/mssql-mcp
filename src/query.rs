@@ -2,14 +2,13 @@
 //! principal.
 //!
 //! There is no statement classifier and no affected-row guard: every batch asks
-//! the human for approval with the exact SQL in the question, and SQL Server
-//! permissions decide what it can do. Only the result set is bounded. A client
-//! without elicitation repeats the call with the token from `approval_required`.
+//! a trusted human for approval with the exact SQL in the question, and SQL
+//! Server permissions decide what it can do. Only the result set is bounded.
+//! Without a trusted approval channel the call fails closed before connecting.
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::approval::ApprovalDecision;
 use crate::statement::Statement;
 
 /// Longest accepted batch in UTF-16 units. The approval prompt carries the
@@ -26,14 +25,6 @@ pub struct Query {
     /// Maximum rows to return from the result set, 1–100; defaults to 100.
     #[schemars(range(min = 1, max = 100))]
     pub limit: Option<u32>,
-    /// One-shot token from an `approval_required` result; omit it on the first
-    /// call, which asks the question instead of running anything.
-    #[serde(default)]
-    pub approval_token: Option<String>,
-    /// Answer relayed on the human's behalf: `grant` runs the batch once,
-    /// `deny` refuses it. Required together with `approval_token`.
-    #[serde(default)]
-    pub approval_decision: Option<ApprovalDecision>,
 }
 
 impl Query {
