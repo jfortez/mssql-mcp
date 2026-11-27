@@ -8,17 +8,20 @@
 //! confirmation. Every other call is refused with `approval_unavailable` before
 //! a connection is opened, and no approval can be supplied as a tool argument.
 //!
-//! The prompt for the table tools names only the tool, the target object, the
-//! column names and the row cap: SQL text, values, filter contents, credentials
-//! and the host stay out of it. The raw `query` prompt is different by design:
-//! it carries the exact batch so the human consents to the real bytes, and that
-//! text never reaches the audit trail or an error message.
+//! The prompt for the table tools names the tool, the unambiguous target and
+//! the exact values to write and equality-filter values to match, so the human
+//! consents to the actual change: SQL text, credentials and the host stay out of
+//! it. The raw `query` prompt is different by design: it carries the exact batch
+//! so the human consents to the real bytes. Neither form reaches the audit trail,
+//! an error message or a tool result; the installed host must show it to the
+//! human and keep it out of logs and model-visible output.
 //!
 //! Trust cannot be established by the protocol: a host can advertise form
 //! elicitation and answer its own prompt. `--trust-elicitation` is therefore an
 //! operator promise about the installed host, and `--yolo` (or
 //! `MSSQL_MCP_YOLO=true`) remains the explicit, documented bypass.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use rmcp::Peer;
@@ -27,6 +30,7 @@ use rmcp::ServiceError;
 use rmcp::service::ElicitationError;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::query::Query;
 use crate::statement::{
@@ -80,8 +84,9 @@ impl Decision {
     }
 }
 
-/// Facts a mutation discloses to the human, all of them validated identifiers,
-/// or the exact raw batch for `query`.
+/// Facts a mutation discloses to the human: validated identifiers, the exact
+/// validated scalar values and filters to match, or the exact raw batch for
+/// `query`.
 pub struct Subject<'a> {
     prompt: Prompt<'a>,
 }
@@ -91,8 +96,8 @@ enum Prompt<'a> {
         tool: &'static str,
         schema: &'a str,
         table: &'a str,
-        value_columns: Vec<&'a str>,
-        filter_columns: Vec<&'a str>,
+        values: Vec<(&'a str, &'a Value)>,
+        filters: Vec<(&'a str, &'a Value)>,
     },
     Batch {
         tool: &'static str,
@@ -104,16 +109,16 @@ impl<'a> Subject<'a> {
     fn new(
         tool: &'static str,
         table: &'a Table,
-        value_columns: Vec<&'a str>,
-        filter_columns: Vec<&'a str>,
+        values: Vec<(&'a str, &'a Value)>,
+        filters: Vec<(&'a str, &'a Value)>,
     ) -> Self {
         Self {
             prompt: Prompt::Object {
                 tool,
                 schema: table.schema.as_deref().unwrap_or("dbo"),
                 table: table.name.as_str(),
-                value_columns,
-                filter_columns,
+                values,
+                filters,
             },
         }
     }
@@ -134,13 +139,17 @@ impl<'a> Subject<'a> {
                 tool,
                 schema,
                 table,
-                value_columns,
-                filter_columns,
+                values,
+                filters,
             } => format!(
-                "Approve {tool} on {schema}.{table}. Value columns: {values}. Filter columns: {filters}. \
+                "Approve {tool} on schema {}, table {}. \
+                 Values to write (JSON; null is SQL NULL, \"null\" is text): {values}. \
+                 Filters (equality predicates joined with AND; JSON null matches SQL NULL): {filters}. \
                  At most {ROW_CAP} rows are targeted; a larger change is rolled back.",
-                values = columns(value_columns),
-                filters = columns(filter_columns),
+                json_string(schema),
+                json_string(table),
+                values = describe(values, "no column values are written"),
+                filters = describe(filters, "no existing rows are matched"),
             ),
             Prompt::Batch { tool, sql } => format!(
                 "Approve {tool}: this runs the following T-SQL batch under the configured principal. \
@@ -151,12 +160,47 @@ impl<'a> Subject<'a> {
     }
 }
 
-fn columns(names: &[&str]) -> String {
-    if names.is_empty() {
-        "none".to_owned()
-    } else {
-        names.join(", ")
+/// Deterministic escaped JSON object for already validated scalar pairs: keys
+/// keep their validated spelling, values keep their JSON type, and nothing is
+/// truncated. A null stays JSON null so the human sees SQL NULL rather than a
+/// text value.
+fn describe(pairs: &[(&str, &Value)], empty: &'static str) -> String {
+    if pairs.is_empty() {
+        return format!("none ({empty})");
     }
+    let entries = pairs
+        .iter()
+        .map(|(column, value)| {
+            let value = match value {
+                Value::String(text) => json_string(text),
+                scalar => scalar.to_string(),
+            };
+            format!("{}:{value}", json_string(column))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{entries}}}")
+}
+
+/// Escape not just JSON delimiters but also controls that can reorder or
+/// split the displayed text. Every escape decodes to the original character.
+fn json_string(text: &str) -> String {
+    let json = Value::String(text.to_owned()).to_string();
+    let mut display = String::with_capacity(json.len());
+    for ch in json.chars() {
+        if ch.is_control()
+            || matches!(
+                ch,
+                '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+                    | '\u{2066}'..='\u{206f}' | '\u{feff}'
+            )
+        {
+            write!(display, "\\u{:04x}", u32::from(ch)).expect("writing to String cannot fail");
+        } else {
+            display.push(ch);
+        }
+    }
+    display
 }
 
 /// Input types that can describe a mutation approval.
@@ -170,7 +214,10 @@ impl Approves for InsertRow {
         Some(Subject::new(
             "insert_row",
             &self.table,
-            self.values.keys().map(String::as_str).collect(),
+            self.values
+                .iter()
+                .map(|(column, value)| (column.as_str(), value))
+                .collect(),
             Vec::new(),
         ))
     }
@@ -181,8 +228,14 @@ impl Approves for UpdateRows {
         Some(Subject::new(
             "update_rows",
             &self.table,
-            self.values.keys().map(String::as_str).collect(),
-            self.filters.keys().map(String::as_str).collect(),
+            self.values
+                .iter()
+                .map(|(column, value)| (column.as_str(), value))
+                .collect(),
+            self.filters
+                .iter()
+                .map(|(column, value)| (column.as_str(), value))
+                .collect(),
         ))
     }
 }
@@ -193,7 +246,10 @@ impl Approves for DeleteRows {
             "delete_rows",
             &self.table,
             Vec::new(),
-            self.filters.keys().map(String::as_str).collect(),
+            self.filters
+                .iter()
+                .map(|(column, value)| (column.as_str(), value))
+                .collect(),
         ))
     }
 }
@@ -249,21 +305,112 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_table_mutation_prompt_names_the_target_without_values_or_sql() {
-        let input = InsertRow {
+    fn a_table_mutation_prompt_carries_exact_values_and_filters_without_sql() {
+        let input = UpdateRows {
             table: Table {
                 schema: Some("sales".to_owned()),
                 name: "Items".to_owned(),
             },
-            values: BTreeMap::from([("label".to_owned(), json!("secret-value"))]),
+            values: BTreeMap::from([
+                ("label".to_owned(), json!("text \"quoted\"\nline")),
+                ("qty".to_owned(), json!(2)),
+                ("active".to_owned(), json!(true)),
+                ("cleared".to_owned(), json!(null)),
+            ]),
+            filters: BTreeMap::from([
+                ("id".to_owned(), json!(7)),
+                ("region".to_owned(), json!("null")),
+                ("missing".to_owned(), json!(null)),
+            ]),
         };
         let subject = input.approval().expect("a mutation has a subject");
         let message = subject.message();
-        for expected in ["insert_row", "sales.Items", "label", "100"] {
+        for expected in [
+            "update_rows",
+            r#"schema "sales", table "Items""#,
+            r#"{"active":true,"cleared":null,"label":"text \"quoted\"\nline","qty":2}"#,
+            r#"{"id":7,"missing":null,"region":"null"}"#,
+            "equality predicates joined with AND",
+            "JSON null matches SQL NULL",
+            "At most 100 rows are targeted; a larger change is rolled back.",
+        ] {
             assert!(message.contains(expected), "{message}");
         }
+        for unexpected in ["UPDATE", "SET ", "@P1"] {
+            assert!(!message.contains(unexpected), "{message}");
+        }
         assert!(
-            !message.contains("secret-value") && !message.contains("INSERT"),
+            message.chars().all(|character| !character.is_control()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn non_applicable_details_are_marked_explicitly() {
+        let insert = InsertRow {
+            table: Table {
+                schema: None,
+                name: "Items".to_owned(),
+            },
+            values: BTreeMap::from([("label".to_owned(), json!("x"))]),
+        };
+        let message = insert
+            .approval()
+            .expect("a mutation has a subject")
+            .message();
+        assert!(
+            message.contains(r#"insert_row on schema "dbo", table "Items""#),
+            "{message}"
+        );
+        assert!(message.contains(r#"{"label":"x"}"#), "{message}");
+        assert!(
+            message.contains(
+                "Filters (equality predicates joined with AND; JSON null matches SQL NULL): \
+                 none (no existing rows are matched)"
+            ),
+            "{message}"
+        );
+
+        let delete = DeleteRows {
+            table: Table {
+                schema: None,
+                name: "Items".to_owned(),
+            },
+            filters: BTreeMap::from([("id".to_owned(), json!(1))]),
+        };
+        let message = delete
+            .approval()
+            .expect("a mutation has a subject")
+            .message();
+        assert!(
+            message.contains(r#"delete_rows on schema "dbo", table "Items""#),
+            "{message}"
+        );
+        assert!(message.contains(r#"{"id":1}"#), "{message}");
+        assert!(
+            message.contains(
+                "Values to write (JSON; null is SQL NULL, \"null\" is text): \
+                 none (no column values are written)"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn target_schema_and_table_stay_unambiguous() {
+        let input = DeleteRows {
+            table: Table {
+                schema: Some("a.b".to_owned()),
+                name: "c.d".to_owned(),
+            },
+            filters: BTreeMap::from([("id".to_owned(), json!(1))]),
+        };
+        let message = input
+            .approval()
+            .expect("a mutation has a subject")
+            .message();
+        assert!(
+            message.contains(r#"schema "a.b", table "c.d""#),
             "{message}"
         );
     }

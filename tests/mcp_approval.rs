@@ -25,6 +25,15 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECTION_GRACE: Duration = Duration::from_millis(100);
 const VALUE_MARKER: &str = "approval-value-marker-1f4b";
 const FILTER_MARKER: &str = "approval-filter-marker-8c2d";
+/// Distinct, non-secret detail fixtures: one marker per JSON scalar type plus a
+/// string whose value needs escaping. The negative number cannot match a
+/// timestamp or a duration in the audit trail.
+const DETAIL_VALUE_TEXT: &str = "approval-detail-value-5b7e";
+const DETAIL_FILTER_TEXT: &str = "approval-detail-filter-2c9a";
+const DETAIL_ESCAPE_TEXT: &str =
+    "approval-detail-escape quote\" slash\\ newline\ntab\tbell\u{7} next-line\u{85} bidi\u{202e}";
+const DETAIL_NUMBER: i64 = -867_530_912;
+const DETAIL_PREFIX: &str = "approval-detail";
 
 /// Loopback peer that counts every accepted TCP connection and closes it, so an
 /// attempted database connection is both visible and harmless.
@@ -532,11 +541,15 @@ fn accepting_the_prompt_reaches_the_database_after_approval() {
         .unwrap_or_else(|| panic!("approval prompt without a message: {request}"));
     for expected in [
         "update_rows",
-        "sales.Items",
+        r#"schema "sales", table "Items""#,
         "label",
         "qty",
         "id",
         "region",
+        r#""label":"approval-value-marker-1f4b""#,
+        r#""qty":2"#,
+        r#""id":7"#,
+        r#""region":"approval-filter-marker-8c2d""#,
         "100",
     ] {
         assert!(
@@ -544,15 +557,7 @@ fn accepting_the_prompt_reaches_the_database_after_approval() {
             "the prompt must name {expected:?}: {message}"
         );
     }
-    for leaked in [
-        VALUE_MARKER,
-        FILTER_MARKER,
-        "UPDATE",
-        "SET ",
-        "@P1",
-        "127.0.0.1",
-        "test-password",
-    ] {
+    for leaked in ["UPDATE", "SET ", "@P1", "127.0.0.1", "test-password"] {
         assert!(
             !message.contains(leaked),
             "the prompt leaked {leaked:?}: {message}"
@@ -590,6 +595,151 @@ fn accepting_the_prompt_reaches_the_database_after_approval() {
         "granted",
         "the audit trail must record the granted approval"
     );
+}
+
+#[test]
+fn structured_mutation_approval_shows_exact_details_without_logging_them() {
+    let peer = CountingPeer::start();
+    let mut server = Server::start("both", peer.port, Yolo::Off, true, true);
+
+    // Deterministic JSON: keys follow the validated BTreeMap order, string
+    // values keep their escapes, numbers/bools/null keep their JSON types.
+    let insert_values = format!(
+        r#"{{"cleared":null,"enabled":true,"note":"approval-detail-escape quote\" slash\\ newline\ntab\tbell\u0007 next-line\u0085 bidi\u202e","qty":{DETAIL_NUMBER},"sku":"{DETAIL_VALUE_TEXT}"}}"#
+    );
+    let update_values = format!(r#"{{"balance":0,"cleared":null,"sku":"{DETAIL_VALUE_TEXT}"}}"#);
+    let update_filters = format!(
+        r#"{{"enabled":false,"id":{DETAIL_NUMBER},"missing":null,"region":"{DETAIL_FILTER_TEXT}"}}"#
+    );
+    let delete_filters =
+        format!(r#"{{"id":{DETAIL_NUMBER},"missing":null,"region":"{DETAIL_FILTER_TEXT}"}}"#);
+
+    let cases = [
+        (
+            "insert_row",
+            json!({
+                "table": {"schema": "sales", "name": "Items"},
+                "values": {
+                    "sku": DETAIL_VALUE_TEXT,
+                    "qty": DETAIL_NUMBER,
+                    "enabled": true,
+                    "cleared": null,
+                    "note": DETAIL_ESCAPE_TEXT,
+                },
+            }),
+            vec![
+                insert_values,
+                "none (no existing rows are matched)".to_owned(),
+            ],
+        ),
+        (
+            "update_rows",
+            json!({
+                "table": {"schema": "sales", "name": "Items"},
+                "values": {"sku": DETAIL_VALUE_TEXT, "balance": 0, "cleared": null},
+                "filters": {
+                    "id": DETAIL_NUMBER,
+                    "region": DETAIL_FILTER_TEXT,
+                    "missing": null,
+                    "enabled": false,
+                },
+            }),
+            vec![update_values, update_filters],
+        ),
+        (
+            "delete_rows",
+            json!({
+                "table": {"schema": "sales", "name": "Items"},
+                "filters": {
+                    "id": DETAIL_NUMBER,
+                    "region": DETAIL_FILTER_TEXT,
+                    "missing": null,
+                },
+            }),
+            vec![
+                delete_filters,
+                "none (no column values are written)".to_owned(),
+            ],
+        ),
+    ];
+
+    for (tool, arguments, expected) in cases {
+        let id = server.begin_tool_call(tool, arguments);
+        let request = server.await_elicitation();
+        let message = request["params"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{tool}: the approval form has no message: {request}"));
+        for fragment in &expected {
+            assert!(
+                message.contains(fragment),
+                "{tool}: the prompt must show {fragment:?}: {message}"
+            );
+        }
+        for expected in [
+            "Values to write (JSON; null is SQL NULL, \"null\" is text)",
+            "Filters (equality predicates joined with AND; JSON null matches SQL NULL)",
+            "At most 100 rows are targeted; a larger change is rolled back.",
+            tool,
+            r#"schema "sales", table "Items""#,
+        ] {
+            assert!(
+                message.contains(expected),
+                "{tool}: the prompt must state {expected:?}: {message}"
+            );
+        }
+        assert!(
+            message.chars().all(|character| !character.is_control()),
+            "{tool}: a raw control character can misrepresent the request: {message}"
+        );
+        for raw_sql in ["INSERT INTO", "UPDATE TOP", "DELETE TOP", "@P1"] {
+            assert!(
+                !message.contains(raw_sql),
+                "{tool}: the structured form must not carry SQL: {message}"
+            );
+        }
+
+        // Decline after reading the form: nothing may reach the database and
+        // the details may not travel back through the tool result or the log.
+        server.answer(&request, json!({"action": "decline"}));
+        let response = server.response(id);
+        let result = &response["result"];
+        let error = approval_error(result);
+        assert_eq!(error["code"], "approval_denied", "{tool}: {response}");
+        assert_eq!(
+            error["mutation_outcome"], "not_attempted",
+            "{tool}: {response}"
+        );
+        assert_eq!(error["retryable"], false, "{tool}: {response}");
+        assert_eq!(error_text(result), error["message"], "{tool}: {response}");
+        let reply = response.to_string();
+        assert!(
+            !reply.contains(DETAIL_PREFIX),
+            "{tool}: the tool result echoed the approval values: {reply}"
+        );
+        assert!(
+            !reply.contains(&DETAIL_NUMBER.to_string()),
+            "{tool}: the tool result echoed the approval number: {reply}"
+        );
+
+        let audit = server.audit_record(tool);
+        assert_eq!(audit["approval"], "denied", "{tool}: {audit}");
+        let audit_text = server.audit.lock().expect("audit lines").join("\n");
+        assert!(
+            !audit_text.contains(DETAIL_PREFIX),
+            "{tool}: the audit trail echoed the approval values: {audit_text}"
+        );
+        assert!(
+            !audit_text.contains(&DETAIL_NUMBER.to_string()),
+            "{tool}: the audit trail echoed the approval number: {audit_text}"
+        );
+
+        thread::sleep(CONNECTION_GRACE);
+        assert_eq!(
+            peer.attempts(),
+            0,
+            "{tool}: a declined mutation must not connect"
+        );
+    }
 }
 
 #[test]
