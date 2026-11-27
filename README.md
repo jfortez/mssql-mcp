@@ -256,6 +256,16 @@ Tool errors keep `isError`, a human-readable `content[0].text` and a `structured
 
 `retryable` is `true` only for a busy server that ran nothing. `mutation_outcome` is present only when the server can describe it: `unknown` means a connection loss or timeout may have reached SQL Server, so read the database state before retrying. When SQL Server itself rejects the statement, the outcome is omitted for reads and raw batches and is `rolled_back` once a generated mutation's transaction is confirmed closed. An unknown tool name stays a JSON-RPC `-32601` error with `data.code: "unknown_tool"`.
 
+## Maintainer releases
+
+1. Bump the version in `Cargo.toml` and refresh `Cargo.lock` on the default branch.
+2. Run **Actions → Release** with `dry_run` enabled. No token, upload, or tag.
+3. Set the `CARGO_REGISTRY_TOKEN` secret and run again with `dry_run` disabled.
+
+The workflow rejects an existing remote `v<version>` before upload. After publishing, it pushes an annotated `v<version>` on the published commit and creates a GitHub Release with generated notes.
+
+If tagging or release creation fails after upload, use the run's commit SHA to restore the missing tag or release. Verify any existing tag without moving it. Don't republish the same version.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

@@ -28,6 +28,7 @@ jobs:
           persist-credentials: false
 
       - name: Require the registry token
+        if: ${{ !inputs.dry_run }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -62,9 +63,12 @@ jobs:
       - name: Refuse an existing tag
         if: ${{ !inputs.dry_run }}
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.value }}
         run: |
-          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+          REMOTE_TAG=$(git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+            ls-remote --refs origin "refs/tags/v$VERSION")
+          if [ -n "$REMOTE_TAG" ]; then
             echo "::error::Tag v$VERSION already exists; bump the version in Cargo.toml before releasing."
             exit 1
           fi
@@ -74,7 +78,7 @@ jobs:
 
       - name: Publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ !inputs.dry_run && secrets.CARGO_REGISTRY_TOKEN || '' }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           if [ "$DRY_RUN" = "true" ]; then
@@ -89,8 +93,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.value }}
         run: |
-          git tag -a "v$VERSION" -m "v$VERSION"
-          git push origin "v$VERSION"
-          gh release create "v$VERSION" \
-            --title "v$VERSION" \
+          TAG="v$VERSION"
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            tag -a "$TAG" -m "$TAG"
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+            push origin "refs/tags/$TAG:refs/tags/$TAG"
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "$TAG" \
             --generate-notes
