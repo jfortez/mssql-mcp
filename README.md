@@ -1,18 +1,18 @@
 # mssql-mcp
 
-Native MCP server for Microsoft SQL Server. Read-only by default, with authenticated Streamable HTTP for sharing one process across clients.
+MCP server for Microsoft SQL Server. Read-only by default; supports stdio and authenticated Streamable HTTP.
 
 ## 1. Install
 
 | Source | Command |
 | --- | --- |
-| This checkout (Rust 1.88+) | `cargo install --path . --locked` |
-| crates.io, after publication | `cargo install mssql-mcp --locked` |
-| Docker | skip Cargo; see [Docker](#docker) |
+| Source (Rust 1.88+) | `cargo install --path . --locked` |
+| [crates.io](https://crates.io/crates/mssql-mcp) | `cargo install mssql-mcp --locked` |
+| Docker | [Run with Compose](#docker) |
 
 ## 2. Configure
 
-Every setting is a command-line flag and an environment variable. Use the environment for secrets.
+Use flags or environment variables. Secrets are environment-only.
 
 | Variable | Flag | Values | Default |
 | --- | --- | --- | --- |
@@ -30,9 +30,11 @@ Every setting is a command-line flag and an environment variable. Use the enviro
 | `MSSQL_TIMEOUT_SECONDS` | `--timeout-seconds` | 1–300, per operation | `15` |
 | `MSSQL_TRUST_SERVER_CERTIFICATE` | `--trust-server-certificate` | `true` skips certificate checks (development only) | `false` |
 
-Authentication modes: `sql` uses the unqualified `MSSQL_USER` login and `MSSQL_PASSWORD`; `ntlm` uses a `DOMAIN\user` `MSSQL_USER` and `MSSQL_PASSWORD`; `windows` uses the current Windows process identity, so it is unavailable on Linux and in the Docker image and does not use the two SQL credentials. Without `--auth`, a backslash in `MSSQL_USER` selects `ntlm` and anything else selects `sql`; an explicit `--auth` always wins, and a combination that contradicts it, such as `--auth sql` with a qualified user, is rejected instead of guessed. No mode falls back to another identity.
+**Authentication.** `sql` uses an unqualified login and password. `ntlm` uses `DOMAIN\user` and a password. `windows` uses the current Windows identity without SQL credentials and is unavailable on Linux or Docker. Without `--auth`, a backslash in `MSSQL_USER` selects `ntlm`; otherwise the default is `sql`. Explicit modes reject incompatible credentials without falling back.
 
-TLS is required and certificates are validated against the system store: use the hostname in the server certificate. `MSSQL_MODE=read` exposes the read tools in the table below; `write` exposes `insert_row`, `update_rows`, `delete_rows`, `query` and `explore_schema`; `both` exposes all 15. Updates and deletes need at least one filter and roll back when more than 100 rows would change. Nothing reaches SQL Server until the human has answered, through one of two channels: a client that advertises MCP elicitation is asked directly before the connection opens, and any other client gets a non-error `approval_required` result with a one-shot token, relays that question to the human and repeats the call with the answer. `--yolo` (or `MSSQL_MCP_YOLO=true`) skips that question and the audit trail records the bypass. Give the login only the SQL Server permissions it needs.
+**TLS.** Use the hostname in the server certificate. The server verifies certificates against the system trust store by default.
+
+**Access.** `read` exposes the read tools; `write` exposes `insert_row`, `update_rows`, `delete_rows`, `query`, and `explore_schema`; `both` exposes all 15. Updates and deletes require filters and roll back above 100 rows. Mutations and `query` require human approval before connecting unless `--yolo` is set. The bypass is audited. Grant the login only the SQL Server permissions it needs.
 
 Validate without connecting: `mssql-mcp --check-config`. All flags: `mssql-mcp --help`.
 
@@ -49,9 +51,9 @@ export MSSQL_MCP_TOKEN="$(openssl rand -hex 32)"
 mssql-mcp --transport http
 ```
 
-The endpoint is `http://127.0.0.1:8765/mcp`. Every request needs `Authorization: Bearer $MSSQL_MCP_TOKEN`, including from loopback. The server rejects foreign `Host` and `Origin` headers, so keep it on loopback and do not add CORS or a reverse proxy.
+Send `Authorization: Bearer $MSSQL_MCP_TOKEN` with every request to `http://127.0.0.1:8765/mcp`. Keep the endpoint on loopback: foreign `Host` and `Origin` headers are rejected. Do not add CORS or a reverse proxy.
 
-A second process on the same address fails at bind, so clients keep addressing exactly one endpoint. All clients share the daemon's SQL identity, mode, `read`/`write` surface and its four concurrent database operations; each tool call still opens its own SQL Server connection. Need different identities or modes? Run another daemon on another port. The HTTP transport cannot show an elicitation prompt, so a mutation or `query` returns `approval_required` instead of running: relay that question to the human and repeat the same request with `approval_token` and `approval_decision`. The token is returned only to the client that asked, it stays redeemable in the daemon for 120 seconds, and `--yolo` remains the audited bypass.
+Clients share one SQL identity, mode, and four concurrent database slots. Each tool call opens its own SQL connection. Use another port for a different identity or mode. HTTP uses the [approval relay](#approving-a-mutation-without-elicitation).
 
 ### Native, one client over stdio
 
@@ -75,7 +77,7 @@ Default transport. Each client entry starts its own process, so stdio is not sha
 
 ### Docker
 
-`compose.yaml` runs one `mssql-mcp` service built from `Dockerfile`: Rust 1.88 builder, `debian:bookworm-slim` runtime, numeric user `10001:10001`, read-only root filesystem, `cap_drop: [ALL]`, `no-new-privileges`, and one loopback-published port. Compose reads these variables from your shell or from `./.env`:
+Compose runs one non-root service with a read-only filesystem, no Linux capabilities, and no new privileges. It reads settings from the shell or `./.env`:
 
 ```sh
 export MSSQL_HOST=sql.example.com MSSQL_DATABASE=Inventory MSSQL_USER=mcp_reader
@@ -88,11 +90,11 @@ docker compose logs -f mssql-mcp  # follow JSON audit lines on stderr
 docker compose down               # stop and remove
 ```
 
-Inside the container the service listens on `0.0.0.0:8765`; only `127.0.0.1:8765` is published to the host, so clients use the same URL and token as the native daemon. Only the variables in the table above reach the container, and `MSSQL_HOST` is resolved inside it: `localhost` there means the container, so use a hostname or IP reachable from the Compose network. Docker Compose may recreate the container on a later `up`, but the same project never runs two.
+The container listens on `0.0.0.0:8765` and publishes only `127.0.0.1:8765`. Use an `MSSQL_HOST` reachable from the container; `localhost` means the container itself.
 
-Rebuild after pulling changes with `docker compose up -d --build`. To rebuild without cache: `docker compose build --no-cache`.
+Rebuild with `docker compose up -d --build`. To bypass the build cache, run `docker compose build --no-cache` first.
 
-Secrets: `MSSQL_PASSWORD` and `MSSQL_MCP_TOKEN` are runtime environment variables, visible to anyone with Docker access (`docker inspect`, `docker compose config`, the host process list). They are not in the image, the build context (`.dockerignore` excludes `.env*`) or Git. Keep `./.env` untracked. The bearer token is a static access gate, not OAuth, and does not encrypt traffic: this image provides no TLS termination, so do not publish the port beyond loopback.
+Keep `.env` untracked. Docker users can inspect runtime secrets; the image and build context do not include them. The bearer token is not OAuth, and the image does not terminate TLS. Keep the published port on loopback.
 
 ## 4. Connect clients
 
@@ -158,7 +160,7 @@ Older releases put the entry directly under `mcp`. `oauth: false` is required be
 
 ### Other ACP hosts
 
-The Agent Client Protocol does not carry an MCP transport by itself. An ACP host can reach this daemon only when its agent or adapter supports remote Streamable HTTP MCP servers; otherwise it spawns its own stdio process per client.
+Use the HTTP daemon if the ACP host's agent or adapter supports Streamable HTTP MCP. Otherwise, run one stdio process per client.
 
 ## Tools
 
@@ -186,25 +188,32 @@ The Agent Client Protocol does not carry an MCP transport by itself. An ACP host
 
 `insert_row` binds numeric JSON values as numbers. SQL Server can implicitly convert them into text columns; pass a JSON string when the exact text matters. A mutation that hits the 100-row rollback guard returns `affected_rows: -1` with `mutation_outcome: rolled_back`.
 
-`query` runs one arbitrary T-SQL batch under the configured principal, exactly as sent. It can read or change any data or server state that principal can reach, including other databases, and it has no affected-row cap. Every batch requires approval unless `--yolo`, and the question carries the exact SQL so the human consents to the real bytes. At most one result set is returned, bounded to 100 rows by default (`limit` can lower it), 16 columns and 1,024 UTF-16 units per cell; a `truncated` flag reports a cut. A batch with no result set returns `executed: true`; more than one result set returns `unrecognized_result` without a mutation outcome. If SQL Server rejects a statement in a raw batch, check the database before retrying: earlier statements may have committed. SQL Server permissions remain the real boundary: the approval question is a guardrail, not a sandbox.
+`query` sends one T-SQL batch unchanged. SQL Server permissions are the boundary: the batch can reach other databases and has no affected-row cap. Approval shows the exact SQL unless `--yolo` is set.
+
+- **One result set:** Up to 100 rows (`limit` can lower it), 16 columns, and 1,024 UTF-16 units per cell. Cuts set `truncated`.
+- **No result set:** Returns `executed: true`.
+- **Multiple result sets:** Returns `unrecognized_result` without a mutation outcome.
+
+Check the database before retrying a failed batch: earlier statements may have committed.
 
 ## Approving a mutation without elicitation
 
-Elicitation is the first channel: when the client advertises the capability, the server asks it directly and the tool call finishes with the mutation result or with `approval_denied`. Every other client, including a transport that carries no client capabilities, uses the relay instead of being refused.
+Clients that advertise elicitation get a direct prompt. Other clients, including HTTP clients, relay the question:
 
-1. The mutation call returns a structured, non-error result with `code: approval_required`. Nothing reached SQL Server. It carries `approval_token` (one-shot, unguessable), `approval_token_id` (its short label), `approval_message` (the exact question: the target and column names for a table mutation, or the exact batch for `query`), `row_cap` (`100`, or `null` for `query`), `expires_in_seconds` (`120`) and `mutation_outcome: not_attempted`. `content[0].text` is the same question plus how to answer, so a text-only client can relay it too.
-2. Show `approval_message` to the human, then repeat the same call with the same arguments plus `approval_token` and `approval_decision`. `grant` runs the statement once; `deny` refuses it. Both answers spend the token.
-3. The retry executes only when the token is known, unexpired, unused, and the statement the server rebuilds from the retry's own arguments is byte-identical to the one the token was issued for. A token for one batch can never run a different batch, a different tool or the same call twice.
+1. Read `approval_required`. It is not an error, and `mutation_outcome: not_attempted` means SQL Server was not contacted.
+2. Show `approval_message` to the human: target and columns for a table mutation, or the exact SQL for `query`. Text-only clients can use `content[0].text`.
+3. Repeat the same call with `approval_token` and `approval_decision`: `grant` runs it once; `deny` refuses it. Both spend the token.
 
-Refusals are named: `approval_token_unknown`, `approval_token_expired`, `approval_token_reused`, `approval_token_mismatch` (different tool, target, values or batch text), and `approval_token_invalid` (`approval_token` and `approval_decision` must be supplied together). None of them reaches SQL Server, and none of them consumes a pending question except expiry and reuse. A question that is never answered stops being redeemable after its 120 seconds, so an abandoned question cannot be approved later in the session.
+The reply includes `approval_token_id` for correlation, `row_cap` (`100`, or `null` for `query`), and `expires_in_seconds` (`120`). A retry must use a known, unexpired, unused token for the same tool and byte-identical statement. Rejected tokens never reach SQL Server; see [error codes](#audit-and-errors).
 
-`explore_schema` is read-only and available in every mode. It returns one indented `tree` string: schemas; under each, tables with column count and primary key, columns with type and nullability, outgoing and incoming foreign-key relations, views, procedures with parameter signatures and definition size, and functions with return type and parameter signatures. `schema` narrows the tree, `include` selects `tables`, `views`, `procedures` and `functions` (all four by default), and `definition: true` inlines procedure and function bodies from `sys.sql_modules`. Foreign-key edges identify the constraint and pair the child and referenced columns in constraint order. Catalog queries and the tree itself are bounded: per-table column cuts and per-routine definition cuts say how much was omitted. Any cut sets `truncated` and ends the tree with a visible `… truncated` line.
+## Reading the catalog
 
-`schema_map` returns separate records for each object and its children with stable IDs. Follow `next_offset` until it is `null`; it is independent of `truncated`, which flags clipped default, computed, or index-filter expressions. Foreign keys include both named endpoints and separate ordered column pairs. The `include` filter accepts `tables`, `views`, `procedures`, and `functions`. Table counts are approximate partition metadata, not `COUNT(*)` scans. `object_dependencies` also reports SQL-expression references that SQL Server cannot resolve locally.
+- **`explore_schema`:** Returns one indented `tree` in every mode. Filter by `schema` or `include` (`tables`, `views`, `procedures`, `functions`; all by default). Use `definition: true` to include procedure and function bodies. Cuts set `truncated` and end the tree with `… truncated`.
+- **`schema_map`:** Returns records with stable IDs. Foreign keys name both endpoints and list column pairs in order. Follow `next_offset` until `null`; `truncated` flags clipped expressions, not missing pages. Table counts come from partition metadata, not `COUNT(*)`.
+- **`routine_definition`:** Pages a procedure, function, view, or trigger body in UTF-16 units. `limit` defaults to 8,000 and caps at 20,000. `definition_length` is the total length. Follow `next_offset` until `null` and join the pages. A NULL body returns `definition_unavailable`.
+- **`dependency_columns`:** Lists referenced objects and their columns. `column_hint` matches a literal fragment; omit it for all columns. Objects with no matches still appear with `matching_column_count: 0`. Unresolved or cross-database objects have a null `object_id` and no readable columns. Follow `next_offset` until `null`.
 
-`routine_definition` reads one procedure, function, view or trigger from `sys.sql_modules` and returns its full definition paged by character. `offset` and `limit` count UTF-16 units, the same unit as the per-cell cap used elsewhere; `limit` defaults to 8,000 and is capped at 20,000. `definition_length` is the total body length, `next_offset` is the next character to read, and `truncated` means more of the body remains. Follow `next_offset` until it is `null` and concatenate the pages to reproduce the stored definition exactly. A NULL definition is reported as `definition_unavailable`, not as an empty body. These reads depend on `VIEW DEFINITION`: without it, `sys.sql_modules` returns no definition and `sys.sql_expression_dependencies` hides the rows, so the same object can look empty to that login.
-
-`dependency_columns` resolves the objects one procedure, function, view or trigger references through `sys.sql_expression_dependencies` and lists their columns. `column_hint` is a literal name fragment matched with `CHARINDEX`; an empty or omitted hint returns every column. Every referenced object appears as an `object` entry, even when the hint matches none of its columns: its `matching_column_count` is `0` and it contributes no `column` entries. An object that does not appear in the feed at all was not referenced. Unresolved or cross-database references still appear as object entries with a null `object_id`, but have no readable columns. Follow `next_offset` until it is `null` to see every referenced object and column.
+`object_dependencies` includes unresolved SQL references. Without `VIEW DEFINITION`, SQL Server can hide definitions and dependency rows.
 
 ## Export a schema map without MCP
 
@@ -213,9 +222,9 @@ mssql-mcp map --format html --out /tmp/sales-schema.html --schema Sales
 mssql-mcp map --format json --out /tmp/sales-schema.json --schema Sales
 ```
 
-Use the same SQL connection flags or `MSSQL_*` connection settings as the server. The command connects directly to SQL Server, reads every catalog page, writes one new file, and exits. It does not start an MCP transport, need a bearer token, or modify the database. Omit `--schema` to export all visible schemas. `mssql-mcp map --help` lists the flags.
+Use the server's SQL flags or `MSSQL_*` settings. `map` reads the catalog directly without MCP, a bearer token, or database writes. Omit `--schema` for all visible schemas. See `mssql-mcp map --help`.
 
-Open the HTML file offline to see tables grouped by schema, with arrows from child tables to the tables they reference. Dashed boxes identify tables outside the selected schema. JSON contains the catalog entries and identifies any clipped expressions. The command refuses to overwrite an existing path.
+HTML shows relationships offline; dashed boxes mark tables outside the selected schema. JSON lists catalog entries and flags clipped expressions. Neither format overwrites an existing file.
 
 ## Audit and errors
 
@@ -227,9 +236,11 @@ JSON Lines on stderr, stdout reserved for MCP. One `tool_call` record per handle
 {"ts":1795707647289,"event":"shutdown","status":"ok"}
 ```
 
-Records carry the known tool name, effective mode, status, error code, duration, the validated `scope` and bounded counters (`rows`, `affected_rows`, `truncated`). Mutation records and every `query` batch that reaches the approval gate add `approval` as `yolo`, `granted`, `denied`, `required` or `unavailable`; `required` is the relay question, and the retry that answers it records `granted` or `denied`. A call that involves a relay token also carries `approval_token_id`, the short label of that token, so a question and its answer can be correlated; the token itself is never recorded. `explore_schema` and the other read tools never carry either field. A `query` record has no `scope`, because arbitrary SQL has no validated target, and it never contains the batch text. Records never contain SQL text, values, credentials, host names, result rows or raw driver messages; validated schema and table names do appear. The trail is operational evidence, not a signed or tamper-proof audit log: capture it with your client or supervisor.
+- **Tool calls:** Record tool, mode, status, error code, duration, validated `scope`, and bounded counters (`rows`, `affected_rows`, `truncated`). `query` has no validated `scope`.
+- **Approval:** Mutations and `query` reaching the approval gate record `approval` as `yolo`, `granted`, `denied`, `required`, or `unavailable`. `approval_token_id` links a relay question to its answer without logging the token. Read tools omit both fields.
+- **Privacy:** Logs omit SQL text, values, credentials, host names, result rows, and raw driver messages. Validated schema and table names can appear. Capture the log with your client or supervisor; it is not tamper-proof.
 
-Tool errors keep `isError`, a human-readable `content[0].text` and a `structuredContent` object with `code`, `message`, `action`, `retryable`, and a `mutation_outcome` for writes when the server can describe it. A SQL Server rejection also includes `sql_error: {number, severity, message}`. Login and transport diagnostics, custom error text, connection details, and known value-bearing error details are not relayed.
+Tool errors return `isError`, readable `content[0].text`, and `structuredContent` with `code`, `message`, `action`, `retryable`, and `mutation_outcome` when known. SQL Server rejections include `sql_error: {number, severity, message}`. Sensitive diagnostics and error text are not relayed.
 
 | `code` | Cause | `mutation_outcome` |
 | --- | --- | --- |
@@ -254,7 +265,7 @@ Tool errors keep `isError`, a human-readable `content[0].text` and a `structured
 | `unrecognized_result` | unexpected result shape from the driver | omitted |
 | `mutation_rolled_back` | more than 100 rows would change | `rolled_back` |
 
-`retryable` is `true` only for a busy server that ran nothing. `mutation_outcome` is present only when the server can describe it: `unknown` means a connection loss or timeout may have reached SQL Server, so read the database state before retrying. When SQL Server itself rejects the statement, the outcome is omitted for reads and raw batches and is `rolled_back` once a generated mutation's transaction is confirmed closed. An unknown tool name stays a JSON-RPC `-32601` error with `data.code: "unknown_tool"`.
+Only `database_busy` is `retryable`. If `mutation_outcome` is `unknown`, check the database before retrying. An unknown tool returns JSON-RPC `-32601` with `data.code: "unknown_tool"`.
 
 ## Maintainer releases
 
@@ -272,10 +283,6 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 ## Working with an agent
 
-Start with `explore_schema` before any query: it returns the schemas, tables, columns, keys, relations and routine signatures in one indented tree, so an agent can see where data lives without guessing. Narrow it with `schema`, or add `definition: true` to read procedure and function bodies.
-
-A reliable order for a new database is `explore_schema` → `describe_table` → `sample_rows` or a sorted `select_rows`. Use `search_objects` if you know part of a name, `object_dependencies` for impact analysis, and `schema_map` when you need to page through the whole catalog.
-
-To audit one routine, read its body with `routine_definition` and follow `next_offset` until it is `null`. Use `object_dependencies` for the edge list, then `dependency_columns` with a hint such as `CreadoEn` to find which referenced table carries that column without calling another tool. Once the table is known, `describe_table` or `select_rows` confirms the data. Remember that a login without `VIEW DEFINITION` sees none of these definitions or dependency rows.
-
-Reach for `query` only when the structured tools cannot express the operation and the human has approved it or deliberately enabled `--yolo`.
+- **Explore data:** `explore_schema` → `describe_table` → `sample_rows` or a sorted `select_rows`. Use `search_objects` for partial names and `schema_map` for the full catalog.
+- **Trace a routine:** `routine_definition` → `object_dependencies` → `dependency_columns`. Use a `column_hint` such as `CreadoEn` to find matching columns on referenced objects.
+- **Run raw SQL:** Use `query` only when structured tools cannot express the operation. It requires human approval unless `--yolo` is set.
